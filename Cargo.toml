@@ -1,0 +1,25 @@
+[package]
+name = "lunet-locks-aof"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+links = "lunet_locks_aof"
+build = "build.rs"
+
+description = "Safe Rust binding over the vendored TigerBeetle AOF (append-only write-behind log, Zig C ABI)"
+license = "Apache-2.0"
+
+[lib]
+name = "lunet_locks_aof"
+crate-type = ["rlib"]
+
+[dependencies]
+
+[features]
+# Link the Zig store statically instead of through the cdylib (the
+# advisory-lock adapter opts in: its own cdylib is loaded by the Lua
+# runtime and must stay self-contained).
+static = []
+
+[dev-dependencies]
+serde_json = "1"
