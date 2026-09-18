@@ -26,8 +26,8 @@ fn main() {
         } else {
             "-Doptimize=Debug"
         };
-        let target = std::env::var("LUNET_LOCKS_AOF_TARGET")
-            .unwrap_or_else(|_| "native".to_string());
+        let target =
+            std::env::var("LUNET_LOCKS_AOF_TARGET").unwrap_or_else(|_| "native".to_string());
         let target_flag = if target == "native" {
             "-Dtarget=native".to_string()
         } else {

@@ -19,6 +19,11 @@ pub const OK: i32 = 0;
 pub const INVALID: i32 = -1;
 pub const TOO_LARGE: i32 = -6;
 pub const SERVICE: i32 = -7;
+/// A readable marker copy failed its checksum: the boot-read law's
+/// refusal (the Zig store's `error.ChecksumRot`). Distinct so the host
+/// adapter can PANIC on it — a bad block is a loud log and a panic,
+/// never a hang, never a clear, never a repair, never a fallback.
+pub const CORRUPT: i32 = -11;
 
 unsafe extern "C" {
     pub fn lunet_aof_open(
@@ -54,6 +59,43 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn lunet_aof_iter_close(it: *mut AofIterRaw);
+
+    /// The marker store's per-copy raw facts (read-only, never
+    /// classified): the `nuke` tool's view of the four copies —
+    /// presence, checksum status, sequence, state code, incarnation.
+    /// `out` holds `copies_count` entries (from `geometry`).
+    pub fn lunet_aof_marker_inspect(
+        path_data: *const u8,
+        path_len: usize,
+        out: *mut CopyInfoRaw,
+    ) -> i32;
+
+    /// The nuke tool's deliberate reset: re-format the marker file FRESH
+    /// at sequence 1 with the named `(incarnation, state)` — an explicit
+    /// operator action behind the tool's own review gate, never a
+    /// boot-read repair.
+    pub fn lunet_aof_marker_format(
+        path_data: *const u8,
+        path_len: usize,
+        incarnation: u64,
+        state: u32,
+    ) -> i32;
+}
+
+/// One copy's raw facts (aof_c.zig `CopyInfo`), C-ABI layout mirrored.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyInfoRaw {
+    /// The zone read a full header.
+    pub readable: u8,
+    /// The header's checksum verifies (only meaningful when readable).
+    pub valid_checksum: u8,
+    pub sequence: u64,
+    /// The raw lifecycle-state code (may be outside the lifecycle).
+    pub state: u32,
+    pub incarnation: u64,
+    pub checksum_lo: u64,
+    pub checksum_hi: u64,
 }
 
 /// The safe append/flush/close surface for one open AOF file.

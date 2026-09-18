@@ -44,11 +44,30 @@
 //!
 //! Fail-closed discipline: a write whose verify read-back fails, and a
 //! read with no valid working quorum, are errors — the caller refuses
-//! rather than guessing an identity. Deleting a rotted marker file is the
-//! recovery path: the host then re-seeds from its own compatibility
-//! projection (the adapter's single marker file, which lags the copies by
+//! rather than guessing an identity. THE BOOT-READ LAW: every block read
+//! validates its checksum before any classification logic, and a bad
+//! checksum on ANY copy is a loud log and the `ChecksumRot` refusal —
+//! the boot never classifies past a bad block, never clears or repairs
+//! one, and never falls back to another store. A tear is the spread
+//! writes being inconsistent across the copies (checksum-valid copies at
+//! differing states) — not a bad checksum on any single write — and it
+//! resolves by the stated thresholds (`.verify` 3/4 write, `.open` 2/4
+//! read), with the non-unanimity logged in full at the moment of
+//! resolution: which copies, their states, their sequences. A unanimous
+//! read logs nothing special. The FFI boundary cannot panic across the
+//! ABI, so the store refuses with `ChecksumRot`, the C ABI spells a
+//! distinct code, and the host adapter panics on it — the panic stays in
+//! the host process, loud. Deleting a rotted marker file is the recovery
+//! path: the host then re-seeds from its own compatibility projection
+//! (the adapter's single marker file, which lags the copies by
 //! at most one transition and can therefore only ever classify more
 //! conservatively).
+//!
+//! No-hang discipline: every call opens, drives, and closes its own file
+//! on the caller's thread — one bounded blocking read per copy, one
+//! fsync, no locks, no retries, no threads — so the boot read cannot
+//! hang: every path from process boot to classification terminates or
+//! fails loud.
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
@@ -57,6 +76,8 @@ const posix = std.posix;
 const constants = @import("constants.zig");
 const vsr = @import("vsr.zig");
 const superblock = @import("vsr/superblock.zig");
+
+const log = std.log.scoped(.marker);
 
 const SuperBlockHeader = superblock.SuperBlockHeader;
 const Quorums = superblock.Quorums;
@@ -122,6 +143,11 @@ pub const Error = error{
     /// quorum (delete the file to re-seed from the compatibility
     /// projection).
     Unformatted,
+    /// A readable copy failed its checksum: THE BOOT-READ LAW — fully
+    /// logged, then refused. Never cleared, never repaired, never fallen
+    /// back, never decided by quorum; the FFI spells it as a distinct
+    /// code and the host adapter panics on it.
+    ChecksumRot,
     FileOpenFailed,
     ReadFailed,
     WriteFailed,
@@ -217,18 +243,45 @@ pub const MarkerStore = struct {
     }
 
     /// Reads every copy and resolves the working quorum (the `.open`
-    /// threshold, highest sequence). `null` when no copy is valid at all;
-    /// every other resolution failure (no quorum, fork, skipped parent) is
-    /// a fail-closed error.
+    /// threshold, highest sequence). `null` when no copy is readable at
+    /// all; every other resolution failure (no quorum, fork, skipped
+    /// parent) is a fail-closed error. Every readable copy's checksum is
+    /// validated before any classification logic: a checksum failure on
+    /// ANY copy is a loud log and the `ChecksumRot` refusal — never
+    /// cleared, never repaired, never quorum-decided. A non-unanimous
+    /// resolution is logged in full (which copies, their states, their
+    /// sequences); a unanimous read logs nothing special.
     fn read_working(store: *MarkerStore) Error!?Working {
+        var readable: [copies_count]bool = @splat(false);
         for (0..copies_count) |index| {
             const buffer = mem.asBytes(&store.reading[index]);
             store.reading[index] = undefined;
             const read = store.file.preadAll(buffer, copy_size * index) catch return error.ReadFailed;
             if (read < copy_header_bytes) {
                 // A torn or absent copy: not evidence, not an error — the
-                // checksum quorum decides.
+                // checksum quorum decides. The slot is zeroed so the
+                // quorum machinery sees a deterministic invalid header,
+                // never stale bytes from an earlier read.
+                store.reading[index] = mem.zeroes(SuperBlockHeader);
                 continue;
+            }
+            readable[index] = true;
+            // THE BOOT-READ LAW: the checksum validates before any
+            // classification logic, and a failure on ANY copy is a loud
+            // refusal — never cleared, never repaired, never fallen back.
+            if (!store.reading[index].valid_checksum()) {
+                log.warn("marker: copy {}/{}: BAD CHECKSUM — the boot read refuses; " ++
+                    "the block is never cleared, never repaired, never quorum-decided " ++
+                    "(checksum={x:0>32} sequence={} state={} incarnation={} copy_field={})", .{
+                    index,
+                    copies_count,
+                    store.reading[index].checksum,
+                    store.reading[index].sequence,
+                    store.reading[index].vsr_state.sync_view,
+                    store.reading[index].vsr_state.commit_max,
+                    store.reading[index].copy,
+                });
+                return error.ChecksumRot;
             }
         }
         var quorums = Quorums{};
@@ -236,12 +289,69 @@ pub const MarkerStore = struct {
             error.NotFound => return null,
             else => return err,
         };
+        log_non_unanimous(store.reading, &readable, quorum);
         return .{
             .sequence = quorum.header.sequence,
             .checksum = quorum.header.checksum,
             .incarnation = quorum.header.vsr_state.commit_max,
             .state = quorum.header.vsr_state.sync_view,
         };
+    }
+
+    /// The non-unanimity log at the moment of resolution: when the
+    /// working quorum resolved but the copies are not unanimous (a torn
+    /// spread — readable copies at differing states, or absent ones), the
+    /// full spread is logged: which copies, their states, their
+    /// sequences, and which of them the resolution carries. A unanimous
+    /// read logs nothing special.
+    fn log_non_unanimous(
+        headers: []const SuperBlockHeader,
+        readable: []const bool,
+        quorum: anytype,
+    ) void {
+        var unanimous = true;
+        for (0..copies_count) |index| {
+            if (!readable[index] or quorum.slots[index] == null) unanimous = false;
+        }
+        if (unanimous) return;
+        log.warn(
+            "marker: NON-UNANIMOUS spread resolved by thresholds: sequence={} " ++
+                "state={} incarnation={} checksum={x:0>32} carried by {} of {} copies",
+            .{
+                quorum.header.sequence,
+                quorum.header.vsr_state.sync_view,
+                quorum.header.vsr_state.commit_max,
+                quorum.header.checksum,
+                quorum.copies.count(),
+                copies_count,
+            },
+        );
+        for (0..copies_count) |index| {
+            if (!readable[index]) {
+                log.warn("marker: copy {}/{}: ABSENT (torn zone; not evidence)", .{
+                    index, copies_count,
+                });
+                continue;
+            }
+            const member = quorum.slots[index] != null;
+            log.warn(
+                "marker: copy {}/{}: {s} sequence={} state={} incarnation={} " ++
+                    "checksum={x:0>32} {s}",
+                .{
+                    index,
+                    copies_count,
+                    if (member) @as([]const u8, "RESOLVED") else @as([]const u8, "outvoted"),
+                    headers[index].sequence,
+                    headers[index].vsr_state.sync_view,
+                    headers[index].vsr_state.commit_max,
+                    headers[index].checksum,
+                    if (member)
+                        @as([]const u8, "")
+                    else
+                        @as([]const u8, "(not carried by the resolution)"),
+                },
+            );
+        }
     }
 
     /// Writes the copyset (each copy stamped with its zone index — the
@@ -272,10 +382,36 @@ pub const MarkerStore = struct {
             store.reading[index] = undefined;
             const read = store.file.preadAll(buffer, copy_size * index) catch return error.ReadFailed;
             if (read < copy_header_bytes) return error.WriteFailed;
+            // THE BOOT-READ LAW at the verify read-back: a readable copy
+            // whose checksum does not verify is storage rot — fully
+            // logged, then refused. Never retried, never repaired.
+            if (!store.reading[index].valid_checksum()) {
+                log.warn("marker: copy {}/{}: BAD CHECKSUM at the write's verify read-back — " ++
+                    "the write refuses; the block is never cleared, never repaired " ++
+                    "(checksum={x:0>32} sequence={} state={} incarnation={})", .{
+                    index,
+                    copies_count,
+                    store.reading[index].checksum,
+                    store.reading[index].sequence,
+                    store.reading[index].vsr_state.sync_view,
+                    store.reading[index].vsr_state.commit_max,
+                });
+                return error.ChecksumRot;
+            }
         }
         var quorums = Quorums{};
         const quorum = quorums.working(store.reading, .verify) catch return error.WriteFailed;
         if (quorum.header.checksum != expected_checksum) return error.WriteFailed;
+    }
+
+    /// The nuke tool's deliberate reset: a FRESH format at sequence 1 —
+    /// four copies of the named `(incarnation, state)`, parent 0, forced
+    /// I/O, verify read-back. This is an explicit operator action over
+    /// the evidence (confirmed by the tool's own review gate), never a
+    /// boot-read repair: no read path formats over anything.
+    pub fn format(store: *MarkerStore, incarnation: u64, state: State) Error!void {
+        var header = marker_header(incarnation, state, 1, 0);
+        try store.commit(&header);
     }
 };
 
@@ -386,7 +522,7 @@ test "marker: a fresh file formats; an existing file must present a working quor
     );
 }
 
-test "marker: a rotted or torn copy cannot decide the read" {
+test "marker: a rotted copy fails the read loud (ChecksumRot), never heals" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -405,21 +541,52 @@ test "marker: a rotted or torn copy cannot decide the read" {
     defer file.close();
     try file.pwriteAll(&garbage, copy_size * 2);
 
+    var before: [copy_header_bytes]u8 = undefined;
+    {
+        var reader = try std.fs.cwd().openFile(file_path, .{});
+        defer reader.close();
+        _ = try reader.preadAll(&before, copy_size * 2);
+    }
+
+    // THE BOOT-READ LAW: a checksum failure on ANY copy is a loud refusal
+    // (error.ChecksumRot → the FFI's distinct code → the adapter panics).
+    // Never quorum-decided, never cleared, never repaired: the rotted
+    // bytes stand unchanged after the refused read.
+    var reopened = try opened(testing.allocator, file_path);
+    defer reopened.close(testing.allocator);
+    try testing.expectError(error.ChecksumRot, reopened.classify());
+    try testing.expectError(error.ChecksumRot, reopened.write(7, .stopped));
+
+    var after: [copy_header_bytes]u8 = undefined;
+    {
+        var reader = try std.fs.cwd().openFile(file_path, .{});
+        defer reader.close();
+        _ = try reader.preadAll(&after, copy_size * 2);
+    }
+    try testing.expectEqualSlices(u8, &before, &after);
+}
+
+test "marker: a torn copy (never fully written) decides nothing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = try tmp_marker_path(&tmp, &buf);
+
+    var store = try opened(testing.allocator, file_path);
+    try store.write(7, .flushed);
+    store.close(testing.allocator);
+
+    // A torn copy (never fully written: the zone reads short) decides
+    // nothing either — absence is not corruption, the checksum quorum
+    // decides among the readable copies.
+    var file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
+    defer file.close();
+    try file.setEndPos(copy_size * 2);
     var reopened = try opened(testing.allocator, file_path);
     defer reopened.close(testing.allocator);
     try testing.expectEqual(
         Classified{ .state = .flushed, .incarnation = 7 },
         try reopened.classify(),
-    );
-
-    // A torn copy (never fully written: the zone reads short) decides
-    // nothing either.
-    try file.setEndPos(copy_size * 2);
-    var reopened2 = try opened(testing.allocator, file_path);
-    defer reopened2.close(testing.allocator);
-    try testing.expectEqual(
-        Classified{ .state = .flushed, .incarnation = 7 },
-        try reopened2.classify(),
     );
 }
 
@@ -531,7 +698,7 @@ test "marker: a forged fork fails closed" {
     try testing.expectError(error.Fork, reopened.classify());
 }
 
-test "marker: a write refuses a regressing incarnation and an unquorum-able file" {
+test "marker: a write refuses a regressing incarnation and a rotted file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -546,8 +713,9 @@ test "marker: a write refuses a regressing incarnation and an unquorum-able file
     );
     store.close(testing.allocator);
 
-    // A file whose copies rotted beyond the read quorum refuses a write
-    // (fail closed) rather than silently re-formatting over evidence.
+    // A file whose copies rotted (bad checksums) refuses a write (fail
+    // closed, loud) rather than silently re-formatting over evidence —
+    // the boot-read law applies to the write's read of the copies too.
     {
         var file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
         defer file.close();
@@ -556,8 +724,8 @@ test "marker: a write refuses a regressing incarnation and an unquorum-able file
     }
     var rotted = try opened(testing.allocator, file_path);
     defer rotted.close(testing.allocator);
-    try testing.expectError(error.QuorumLost, rotted.write(9, .stopped));
-    try testing.expectError(error.QuorumLost, rotted.classify());
+    try testing.expectError(error.ChecksumRot, rotted.write(9, .stopped));
+    try testing.expectError(error.ChecksumRot, rotted.classify());
 }
 
 // The rig's andon shape: the first boot over a wiped state dir. The state
