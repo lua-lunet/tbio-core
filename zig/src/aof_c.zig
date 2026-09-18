@@ -387,9 +387,22 @@ export fn lunet_aof_marker_classify(
 fn marker_error(err: anyerror) i32 {
     return switch (err) {
         error.IncarnationRegressed => INVALID,
-        error.ChecksumRot => CORRUPT,
+        // Checksum-class corruption (a rotted checksum, or a
+        // checksum-valid copy whose state string disagrees with its
+        // numeric state): the boot-read law's distinct code — the host
+        // adapter panics on it.
+        error.ChecksumRot, error.StateStringDisagreement => CORRUPT,
         else => SERVICE,
     };
+}
+
+/// The byte offset of the marker header's on-disk state string (the
+/// fixed-width, space-padded name) within one copy zone: where a raw
+/// hexdump of a written block reads the state. The offset of the vendored
+/// header's `state_string` field, exported so a C-ABI host never
+/// hard-codes the vendored layout.
+export fn lunet_aof_marker_state_string_offset() usize {
+    return @offsetOf(superblock.SuperBlockHeader, "state_string");
 }
 
 /// One copy's raw facts for the inspect export: everything the `nuke`

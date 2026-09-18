@@ -259,3 +259,97 @@ fn marker_a_single_advanced_copy_cannot_fake_a_clean_stop() {
     );
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The operator's law, the block half, read back through the C ABI: each
+/// copy of a written block carries the fixed-width space-padded state
+/// name at the reported offset — a raw hexdump reads the state directly —
+/// and the Rust side's const table spells exactly the bytes the Zig store
+/// stamped, so the two sides' tables can never disagree.
+#[test]
+fn marker_the_block_carries_the_readable_state_string() {
+    let dir = workdir("state-string");
+    let path = dir.join("state.superblock");
+    let geometry = marker::geometry().expect("geometry");
+    let offset = marker::state_string_offset();
+
+    let lifecycle = [
+        (MarkerState::Unflushed, "unflushed"),
+        (MarkerState::Stopped, "stopped"),
+        (MarkerState::Flushed, "flushed"),
+    ];
+    for (state, name) in lifecycle {
+        marker::write(&path, 7, state).expect("the transition writes");
+        let expected =
+            marker::state_string_padded(state.code()).expect("a lifecycle state has a string");
+        for slot in 0..geometry.copies {
+            let bytes = read_copy(&path, slot, geometry);
+            let stamped = &bytes[offset..offset + marker::STATE_STRING_LEN];
+            assert_eq!(
+                stamped,
+                expected.as_slice(),
+                "copy {slot}: the padded name is stamped from the shared table"
+            );
+            assert_eq!(&stamped[..name.len()], name.as_bytes());
+            assert!(
+                stamped[name.len()..].iter().all(|byte| *byte == b' '),
+                "copy {slot}: the tail is spaces, the name is the head"
+            );
+        }
+    }
+
+    // The code paths a human reads spell names, not codes.
+    assert_eq!(marker::state_name(2), Some("flushed"));
+    assert_eq!(marker::state_name(3), None);
+    assert_eq!(
+        MarkerState::from_code(2).map(MarkerState::name),
+        Some("flushed")
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The block's state string is hexdump-readable: the ASCII rendering of a
+/// copy's leading zone carries the padded name in place, and the string
+/// sits inside the checksummed header (tampering with it rots the
+/// checksum — the disagreement case itself is refused by the store and
+/// pinned in the Zig suite, which can recompute the vendored checksum).
+#[test]
+fn marker_the_state_string_reads_in_a_hexdump() {
+    let dir = workdir("hexdump");
+    let path = dir.join("state.superblock");
+    marker::write(&path, 5, MarkerState::Flushed).expect("flushed");
+
+    let bytes = read_copy(&path, 0, marker::geometry().expect("geometry"));
+    let offset = marker::state_string_offset();
+    let mut hexdump = String::new();
+    for (index, byte) in bytes[..offset + marker::STATE_STRING_LEN]
+        .iter()
+        .enumerate()
+    {
+        if index % 16 == 0 {
+            hexdump.push_str(&format!("{index:08x}  "));
+        }
+        hexdump.push_str(&format!("{byte:02x} "));
+        if index % 16 == 15 {
+            hexdump.push('\n');
+        }
+    }
+    let ascii: String = bytes[offset..offset + marker::STATE_STRING_LEN]
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    assert!(
+        ascii.starts_with("flushed"),
+        "the name reads in place: {ascii:?}"
+    );
+    assert!(
+        hexdump.contains("66 6c 75 73") && hexdump.contains("68 65 64"),
+        "the hexdump spells 'flushed':\n{hexdump}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}

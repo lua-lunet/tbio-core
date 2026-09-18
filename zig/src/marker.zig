@@ -68,6 +68,20 @@
 //! fsync, no locks, no retries, no threads — so the boot read cannot
 //! hang: every path from process boot to classification terminates or
 //! fails loud.
+//!
+//! The readable block: the operator's law is that no state is a bare
+//! integer a human must memorise. Each copy's header carries the
+//! lifecycle state twice — the numeric code in `vsr_state.sync_view` and
+//! a fixed-width, space-padded name (`"flushed         "`) in the
+//! header's spare `state_string` bytes (the vendored `SuperBlockHeader`'s
+//! former reserved tail, inside the checksum) — both stamped at compile
+//! time from the one `state_strings`/`state_names` table, so a write can
+//! never stamp disagreeing halves. Every read enforces the agreement: a
+//! checksum-valid copy whose string disagrees with its numeric state is
+//! checksum-class corruption under the boot-read law (the
+//! `StateStringDisagreement` refusal, spelled `CORRUPT` across the FFI,
+//! the host adapter panics on it — never cleared, never repaired, never
+//! quorum-decided). The logs print the states' names, never their codes.
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
@@ -113,7 +127,68 @@ pub const State = enum(u32) {
         if (code > @intFromEnum(State.flushed)) return null;
         return @enumFromInt(code);
     }
+
+    /// The state's name, for every surface a human reads: `state=flushed`,
+    /// never `state=2`. The on-disk code and every comparison stay
+    /// numeric; the name is stated next to the numbering it names so the
+    /// two cannot drift apart. The on-disk spelling is the contract's:
+    /// the running sentinel is spelled `unflushed`.
+    pub fn name(self: State) []const u8 {
+        return state_names[@intFromEnum(self)];
+    }
 };
+
+/// The lifecycle states' names, indexed by the on-disk state code — the
+/// one table every human surface (the logs, the on-disk string, the
+/// inspect export's consumers) spells the states from.
+pub const state_names = [_][]const u8{ "unflushed", "stopped", "flushed" };
+
+/// The name a state code spells, or `null` for a code outside the
+/// lifecycle.
+pub fn state_name(code: u32) ?[]const u8 {
+    if (code >= state_names.len) return null;
+    return state_names[code];
+}
+
+/// The states' fixed-width, space-padded on-disk strings, precomputed at
+/// compile time from `state_names`: the marker header's `state_string`
+/// field is stamped from this table — the same table the numeric field's
+/// names come from — so the block's string and its numeric state can
+/// never disagree at write time, and a hexdump reads the state directly.
+pub const state_strings: [state_names.len][SuperBlockHeader.state_string_len]u8 = blk: {
+    var out: [state_names.len][SuperBlockHeader.state_string_len]u8 = undefined;
+    for (state_names, 0..) |name, index| {
+        @memset(&out[index], ' ');
+        @memcpy(out[index][0..name.len], name);
+    }
+    break :blk out;
+};
+
+/// The string stamped for a state code, or `null` for a code outside the
+/// lifecycle.
+pub fn state_string(code: u32) ?*const [SuperBlockHeader.state_string_len]u8 {
+    if (code >= state_names.len) return null;
+    return &state_strings[code];
+}
+
+/// The human word for a state code, for the log lines: the name when the
+/// code is a lifecycle state, `invalid(<code>)` otherwise — never a bare
+/// integer for a human to memorise. `buffer` carries the fallback's
+/// rendering when the code is outside the lifecycle.
+fn state_word(buffer: []u8, code: u32) []const u8 {
+    if (state_name(code)) |name| return name;
+    return std.fmt.bufPrint(buffer, "invalid({d})", .{code}) catch "invalid";
+}
+
+/// The block's state-string bytes as a log-safe slice: printable bytes
+/// pass, anything else renders as a dot — a rotted or forged string is
+/// logged, never raw.
+fn as_readable_string(bytes: *const [SuperBlockHeader.state_string_len]u8) []const u8 {
+    for (bytes) |byte| {
+        if (!std.ascii.isPrint(byte) and byte != ' ') return "<unreadable>";
+    }
+    return bytes;
+}
 
 pub const Classified = struct {
     state: State,
@@ -137,6 +212,13 @@ pub const Error = error{
     VSRStateNotMonotonic,
     /// The working quorum's state code is not a lifecycle state.
     InvalidState,
+    /// A readable, checksum-valid copy whose on-disk state string
+    /// disagrees with its numeric state field: checksum-class corruption.
+    /// THE BOOT-READ LAW — fully logged, then refused; never cleared,
+    /// never repaired, never quorum-decided. The FFI spells it as the
+    /// same distinct code as `ChecksumRot` and the host adapter panics
+    /// on it.
+    StateStringDisagreement,
     /// A write refused: the incarnation would regress the marker.
     IncarnationRegressed,
     /// A write refused: the marker file's copies rotted beyond the read
@@ -270,18 +352,43 @@ pub const MarkerStore = struct {
             // classification logic, and a failure on ANY copy is a loud
             // refusal — never cleared, never repaired, never fallen back.
             if (!store.reading[index].valid_checksum()) {
+                var word_buf: [32]u8 = undefined;
                 log.warn("marker: copy {}/{}: BAD CHECKSUM — the boot read refuses; " ++
                     "the block is never cleared, never repaired, never quorum-decided " ++
-                    "(checksum={x:0>32} sequence={} state={} incarnation={} copy_field={})", .{
+                    "(checksum={x:0>32} sequence={} state={s} state_string=\"{s}\" incarnation={} copy_field={})", .{
                     index,
                     copies_count,
                     store.reading[index].checksum,
                     store.reading[index].sequence,
-                    store.reading[index].vsr_state.sync_view,
+                    state_word(&word_buf, store.reading[index].vsr_state.sync_view),
+                    as_readable_string(&store.reading[index].state_string),
                     store.reading[index].vsr_state.commit_max,
                     store.reading[index].copy,
                 });
                 return error.ChecksumRot;
+            }
+            // The string half of the state agrees with the numeric half,
+            // or the copy is corruption: a checksum-valid copy whose
+            // padded name disagrees with its numeric state is refused
+            // exactly like a bad checksum (checksum-class, THE BOOT-READ
+            // LAW) — a forged copy can recompute a checksum, but it
+            // cannot make the block's two halves agree.
+            const code = store.reading[index].vsr_state.sync_view;
+            if (state_string(code)) |expected| {
+                if (!mem.eql(u8, &store.reading[index].state_string, expected)) {
+                    log.warn("marker: copy {}/{}: STATE STRING DISAGREES WITH THE NUMERIC " ++
+                        "STATE — checksum-class corruption, the boot read refuses; the block " ++
+                        "is never cleared, never repaired, never quorum-decided " ++
+                        "(sequence={} state={s} state_string=\"{s}\" incarnation={})", .{
+                        index,
+                        copies_count,
+                        store.reading[index].sequence,
+                        state_name(code).?,
+                        as_readable_string(&store.reading[index].state_string),
+                        store.reading[index].vsr_state.commit_max,
+                    });
+                    return error.StateStringDisagreement;
+                }
             }
         }
         var quorums = Quorums{};
@@ -314,12 +421,13 @@ pub const MarkerStore = struct {
             if (!readable[index] or quorum.slots[index] == null) unanimous = false;
         }
         if (unanimous) return;
+        var word_buf: [32]u8 = undefined;
         log.warn(
             "marker: NON-UNANIMOUS spread resolved by thresholds: sequence={} " ++
-                "state={} incarnation={} checksum={x:0>32} carried by {} of {} copies",
+                "state={s} incarnation={} checksum={x:0>32} carried by {} of {} copies",
             .{
                 quorum.header.sequence,
-                quorum.header.vsr_state.sync_view,
+                state_word(&word_buf, quorum.header.vsr_state.sync_view),
                 quorum.header.vsr_state.commit_max,
                 quorum.header.checksum,
                 quorum.copies.count(),
@@ -333,16 +441,18 @@ pub const MarkerStore = struct {
                 });
                 continue;
             }
+            var member_word_buf: [32]u8 = undefined;
             const member = quorum.slots[index] != null;
             log.warn(
-                "marker: copy {}/{}: {s} sequence={} state={} incarnation={} " ++
+                "marker: copy {}/{}: {s} sequence={} state={s} state_string=\"{s}\" incarnation={} " ++
                     "checksum={x:0>32} {s}",
                 .{
                     index,
                     copies_count,
                     if (member) @as([]const u8, "RESOLVED") else @as([]const u8, "outvoted"),
                     headers[index].sequence,
-                    headers[index].vsr_state.sync_view,
+                    state_word(&member_word_buf, headers[index].vsr_state.sync_view),
+                    as_readable_string(&headers[index].state_string),
                     headers[index].vsr_state.commit_max,
                     headers[index].checksum,
                     if (member)
@@ -386,14 +496,15 @@ pub const MarkerStore = struct {
             // whose checksum does not verify is storage rot — fully
             // logged, then refused. Never retried, never repaired.
             if (!store.reading[index].valid_checksum()) {
+                var word_buf: [32]u8 = undefined;
                 log.warn("marker: copy {}/{}: BAD CHECKSUM at the write's verify read-back — " ++
                     "the write refuses; the block is never cleared, never repaired " ++
-                    "(checksum={x:0>32} sequence={} state={} incarnation={})", .{
+                    "(checksum={x:0>32} sequence={} state={s} incarnation={})", .{
                     index,
                     copies_count,
                     store.reading[index].checksum,
                     store.reading[index].sequence,
-                    store.reading[index].vsr_state.sync_view,
+                    state_word(&word_buf, store.reading[index].vsr_state.sync_view),
                     store.reading[index].vsr_state.commit_max,
                 });
                 return error.ChecksumRot;
@@ -457,6 +568,11 @@ fn marker_header(incarnation: u64, state: State, sequence: u64, parent: u128) Su
     vsr_state.commit_max = incarnation;
     vsr_state.sync_view = @intFromEnum(state);
     header.vsr_state = vsr_state;
+    // The readable half of the state: stamped from the same const table
+    // the numeric field's names come from, so the block's string and its
+    // numeric state can never disagree at write time (the read enforces
+    // the same agreement on every copy).
+    header.state_string = state_strings[@intFromEnum(state)];
     return header;
 }
 
@@ -680,8 +796,11 @@ test "marker: a forged fork fails closed" {
     store.close(testing.allocator);
 
     // Forge copy 0: same sequence, contradictory state, recomputed
-    // checksum — a copy that lies while passing its checksum. The read
-    // fails closed (error.Fork) instead of letting it decide.
+    // checksum — a copy that lies while passing its checksum. Both halves
+    // of the state are forged coherently (the numeric field and the
+    // string stamped from the same table, exactly as a real forked write
+    // would produce): the string/numeric agreement passes, and the read
+    // fails closed (error.Fork) instead of letting the copy decide.
     var forged: SuperBlockHeader = undefined;
     {
         var file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
@@ -689,6 +808,7 @@ test "marker: a forged fork fails closed" {
         _ = try file.preadAll(mem.asBytes(&forged), copy_size * 0);
         assert(forged.copy == 0);
         forged.vsr_state.sync_view = @intFromEnum(State.unflushed);
+        forged.state_string = state_strings[@intFromEnum(State.unflushed)];
         forged.set_checksum();
         try file.pwriteAll(mem.asBytes(&forged), copy_size * 0);
     }
@@ -803,4 +923,112 @@ test "marker: a survivor boot over an existing marker chains unchanged" {
         Classified{ .state = .flushed, .incarnation = 5 },
         try again.classify(),
     );
+}
+
+// The operator's law, the block half: the state is readable in a raw
+// hexdump. Each copy carries the fixed-width space-padded name stamped
+// from the same const table the numeric field uses — the padded bytes at
+// the header's `state_string` offset spell the state, the field's
+// leading bytes are the name, the tail is spaces.
+test "marker: the block carries the readable state string" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = try tmp_marker_path(&tmp, &buf);
+
+    const string_offset = @offsetOf(SuperBlockHeader, "state_string");
+    try testing.expectEqual(@as(usize, 16), SuperBlockHeader.state_string_len);
+
+    const lifecycle = [_]State{ .unflushed, .stopped, .flushed };
+    for (lifecycle) |state| {
+        var store = try opened(testing.allocator, file_path);
+        errdefer store.close(testing.allocator);
+        try store.write(7, state);
+        store.close(testing.allocator);
+
+        var copy: [copy_header_bytes]u8 = undefined;
+        {
+            var file = try std.fs.cwd().openFile(file_path, .{});
+            defer file.close();
+            _ = try file.preadAll(&copy, 0);
+        }
+        const stamped = copy[string_offset..][0..SuperBlockHeader.state_string_len];
+        try testing.expectEqualSlices(u8, state_strings[@intFromEnum(state)][0..], stamped);
+        try testing.expectEqualStrings(state.name(), std.mem.trim(u8, stamped, " "));
+        for (stamped[state.name().len..]) |byte| {
+            try testing.expectEqual(@as(u8, ' '), byte);
+        }
+    }
+
+    // A fresh write of the next transition keeps the same discipline (the
+    // string is re-stamped from the table, never stale).
+    var store = try opened(testing.allocator, file_path);
+    defer store.close(testing.allocator);
+    try store.write(8, .flushed);
+    try testing.expectEqual(
+        Classified{ .state = .flushed, .incarnation = 8 },
+        try store.classify(),
+    );
+}
+
+// The string/numeric disagreement is checksum-class corruption: a copy
+// whose checksum was recomputed over disagreeing halves is refused loud
+// (StateStringDisagreement), never quorum-decided, never healed — the
+// forged bytes stand unchanged after the refused read.
+test "marker: a forged string/numeric disagreement refuses loud, never heals" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = try tmp_marker_path(&tmp, &buf);
+
+    var store = try opened(testing.allocator, file_path);
+    try store.write(9, .flushed);
+    store.close(testing.allocator);
+
+    // Forge copy 1: the numeric state says `flushed`, the string says
+    // `stopped`, and the checksum is recomputed over the lie — a copy
+    // that passes its checksum while contradicting itself.
+    var forged: SuperBlockHeader = undefined;
+    var before: [copy_header_bytes]u8 = undefined;
+    {
+        var file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
+        defer file.close();
+        _ = try file.preadAll(mem.asBytes(&forged), copy_size * 1);
+        assert(forged.copy == 1);
+        assert(State.from_code(forged.vsr_state.sync_view).? == .flushed);
+        @memcpy(&forged.state_string, &state_strings[@intFromEnum(State.stopped)]);
+        // The checksum excludes the `copy` field (upstream's own
+        // discipline): zero it for the recompute, restore it for the
+        // write-back so the forged copy keeps its zone index.
+        forged.copy = 0;
+        forged.set_checksum();
+        forged.copy = 1;
+        try file.pwriteAll(mem.asBytes(&forged), copy_size * 1);
+        _ = try file.preadAll(&before, copy_size * 1);
+    }
+
+    var reopened = try opened(testing.allocator, file_path);
+    defer reopened.close(testing.allocator);
+    try testing.expectError(error.StateStringDisagreement, reopened.classify());
+    try testing.expectError(error.StateStringDisagreement, reopened.write(9, .stopped));
+
+    var after: [copy_header_bytes]u8 = undefined;
+    {
+        var file = try std.fs.cwd().openFile(file_path, .{});
+        defer file.close();
+        _ = try file.preadAll(&after, copy_size * 1);
+    }
+    try testing.expectEqualSlices(u8, &before, &after);
+}
+
+// The logs spell states' names, never their codes: the human word for a
+// lifecycle code is the name, an out-of-lifecycle code renders as
+// invalid(N), never a bare integer.
+test "marker: the state words render names, not codes" {
+    var buffer: [32]u8 = undefined;
+    try testing.expectEqualStrings("unflushed", state_word(&buffer, 0));
+    try testing.expectEqualStrings("stopped", state_word(&buffer, 1));
+    try testing.expectEqualStrings("flushed", state_word(&buffer, 2));
+    try testing.expectEqualStrings("invalid(7)", state_word(&buffer, 7));
+    try testing.expectEqualStrings("flushed", State.flushed.name());
 }

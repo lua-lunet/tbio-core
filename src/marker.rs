@@ -19,6 +19,16 @@
 //! to it — the contract's marker-write rule, built on the vendored
 //! construction.
 //!
+//! The readable block: each copy carries its lifecycle state twice — the
+//! numeric code and a fixed-width, space-padded name
+//! ([`state_string_padded`], stamped from the same const table the
+//! numeric field's names come from) — so a raw hexdump reads the state
+//! directly. The Zig store stamps both halves from one table and refuses
+//! any copy whose halves disagree as checksum-class corruption (the same
+//! [`CORRUPT`] code, the host adapter panics on it). [`state_name`] and
+//! [`MarkerState::name`] spell the names for the human surfaces on this
+//! side of the FFI.
+//!
 //! The single-threaded discipline applies (the C ABI surface is driven
 //! from the caller's thread; the marker store opens, drives, and closes
 //! its own file per call).
@@ -71,6 +81,59 @@ impl MarkerState {
     pub fn code(self) -> u32 {
         self as u32
     }
+
+    /// The state's name, for every surface a human reads (a log line, a
+    /// report, the nuke tool's print path): `state=flushed`, never
+    /// `state=2`. The on-disk code and every comparison stay numeric; the
+    /// name is the same word the Zig store spells (the one table on each
+    /// side of the FFI, kept in agreement by the layout tests).
+    pub const fn name(self) -> &'static str {
+        match self {
+            MarkerState::Unflushed => "unflushed",
+            MarkerState::Stopped => "stopped",
+            MarkerState::Flushed => "flushed",
+        }
+    }
+}
+
+/// The lifecycle states' names, indexed by the on-disk state code — the
+/// Rust side's half of the one table (the Zig store's `state_names` is
+/// the other), the words every human surface spells the states from.
+pub const STATE_NAMES: [&str; 3] = ["unflushed", "stopped", "flushed"];
+
+/// The name a state code spells, or `None` for a code outside the
+/// lifecycle.
+pub const fn state_name(code: u32) -> Option<&'static str> {
+    match code {
+        0 => Some(STATE_NAMES[0]),
+        1 => Some(STATE_NAMES[1]),
+        2 => Some(STATE_NAMES[2]),
+        _ => None,
+    }
+}
+
+/// The block's state-string width: the fixed-width, space-padded name
+/// each copy carries beside its numeric state (the Zig
+/// `SuperBlockHeader.state_string_len`).
+pub const STATE_STRING_LEN: usize = 16;
+
+/// The space-padded on-disk string stamped for a state code, or `None`
+/// for a code outside the lifecycle: the same 16 bytes the Zig store
+/// stamps (`state_strings`), precomputed at compile time. The layout
+/// tests read a written block back through this table, so the two sides'
+/// tables can never disagree.
+pub const fn state_string_padded(code: u32) -> Option<[u8; STATE_STRING_LEN]> {
+    let Some(name) = state_name(code) else {
+        return None;
+    };
+    let name_bytes = name.as_bytes();
+    let mut out = [b' '; STATE_STRING_LEN];
+    let mut index = 0;
+    while index < name_bytes.len() {
+        out[index] = name_bytes[index];
+        index += 1;
+    }
+    Some(out)
 }
 
 /// A boot classification: the working quorum's lifecycle state and the
@@ -83,6 +146,9 @@ pub struct Classified {
 
 unsafe extern "C" {
     fn lunet_aof_marker_geometry(out_copies: *mut usize, out_copy_size: *mut usize) -> i32;
+    /// The byte offset of the on-disk state string within one copy zone
+    /// (the vendored header's `state_string` field).
+    fn lunet_aof_marker_state_string_offset() -> usize;
     fn lunet_aof_marker_write(
         path_data: *const u8,
         path_len: usize,
@@ -117,6 +183,14 @@ pub fn geometry() -> io::Result<Geometry> {
         return Err(io::Error::other(format!("marker geometry FFI code {rc}")));
     }
     Ok(Geometry { copies, copy_size })
+}
+
+/// The byte offset of the on-disk state string (the fixed-width,
+/// space-padded name) within one copy zone: where a raw hexdump of a
+/// written block reads the state. Reported by the Zig side so no Rust
+/// surface hard-codes the vendored layout.
+pub fn state_string_offset() -> usize {
+    unsafe { lunet_aof_marker_state_string_offset() }
 }
 
 /// One lifecycle transition: quorum-write `(incarnation, state)` into the
