@@ -405,9 +405,9 @@ export fn lunet_aof_marker_state_string_offset() usize {
     return @offsetOf(superblock.SuperBlockHeader, "state_string");
 }
 
-/// One copy's raw facts for the inspect export: everything the `nuke`
-/// test tool prints about the marker store's copies. Pure diagnostics —
-/// the store itself is never mutated by an inspect.
+/// One copy's raw facts for the inspect export: everything the
+/// `lunet_locks_nuke` admin tool prints about the marker store's copies.
+/// Pure diagnostics — the store itself is never mutated by an inspect.
 pub const CopyInfo = extern struct {
     /// The zone read a full header.
     readable: u8,
@@ -422,10 +422,11 @@ pub const CopyInfo = extern struct {
 };
 
 /// The marker store's per-copy raw facts (read-only, never classified):
-/// the `nuke` tool's view of the four copies — presence, checksum
-/// status, sequence, state code, incarnation. Missing zones read as
-/// `readable = 0` with the remaining fields zero. A missing file reports
-/// SERVICE; the caller distinguishes with its own existence check.
+/// the `lunet_locks_nuke` admin tool's view of the four copies —
+/// presence, checksum status, sequence, state code, incarnation. Missing
+/// zones read as `readable = 0` with the remaining fields zero. A missing
+/// file reports SERVICE; the caller distinguishes with its own existence
+/// check.
 export fn lunet_aof_marker_inspect(
     path_data: [*]const u8,
     path_len: usize,
@@ -463,7 +464,7 @@ export fn lunet_aof_marker_inspect(
     return OK;
 }
 
-/// The nuke tool's deliberate reset: re-format the marker file FRESH at
+/// The `lunet_locks_nuke` admin tool's deliberate reset: re-format the marker file FRESH at
 /// sequence 1 with the named `(incarnation, state)` — four copies,
 /// forced I/O, verify read-back. An explicit operator action (the tool's
 /// own review gate confirms it), never a boot-read repair: no read path

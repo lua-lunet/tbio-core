@@ -515,7 +515,7 @@ pub const MarkerStore = struct {
         if (quorum.header.checksum != expected_checksum) return error.WriteFailed;
     }
 
-    /// The nuke tool's deliberate reset: a FRESH format at sequence 1 —
+    /// The `lunet_locks_nuke` admin tool's deliberate reset: a FRESH format at sequence 1 —
     /// four copies of the named `(incarnation, state)`, parent 0, forced
     /// I/O, verify read-back. This is an explicit operator action over
     /// the evidence (confirmed by the tool's own review gate), never a

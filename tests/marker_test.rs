@@ -57,8 +57,8 @@ fn marker_write_then_classify_round_trips_the_lifecycle() {
 }
 
 /// The inspect: a healthy store reads as four present, checksum-valid
-/// copies at the same sequence and state — the raw facts the nuke tool
-/// prints.
+/// copies at the same sequence and state — the raw facts the
+/// `lunet_locks_nuke` admin tool prints.
 #[test]
 fn marker_inspect_reports_the_healthy_copies_raw() {
     let dir = workdir("inspect");
@@ -77,7 +77,7 @@ fn marker_inspect_reports_the_healthy_copies_raw() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The nuke tool's reset: a fresh format at sequence 1 with the named
+/// The `lunet_locks_nuke` admin tool's reset: a fresh format at sequence 1 with the named
 /// `(incarnation, state)`, over whatever the store held — an explicit
 /// operator action, and the classification reads exactly what it wrote.
 #[test]

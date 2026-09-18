@@ -83,7 +83,7 @@ impl MarkerState {
     }
 
     /// The state's name, for every surface a human reads (a log line, a
-    /// report, the nuke tool's print path): `state=flushed`, never
+    /// report, the admin tool's print path): `state=flushed`, never
     /// `state=2`. The on-disk code and every comparison stay numeric; the
     /// name is the same word the Zig store spells (the one table on each
     /// side of the FFI, kept in agreement by the layout tests).
@@ -231,9 +231,9 @@ pub fn classify(path: &std::path::Path) -> Result<Classified, i32> {
 }
 
 /// One copy's raw facts as the store's inspect export reports them: the
-/// `nuke` tool's view of the marker store's four copies — presence,
-/// checksum status, sequence, state code, incarnation. Pure
-/// diagnostics: an inspect never mutates the store.
+/// `lunet_locks_nuke` admin tool's view of the marker store's four
+/// copies — presence, checksum status, sequence, state code, incarnation.
+/// Pure diagnostics: an inspect never mutates the store.
 pub type CopyInfo = crate::ffi::CopyInfoRaw;
 
 /// The marker store's per-copy raw facts, read-only and never
@@ -263,13 +263,16 @@ pub fn inspect(path: &std::path::Path) -> io::Result<Vec<CopyInfo>> {
     Ok(out)
 }
 
-/// The nuke tool's deliberate reset: re-format the marker file FRESH at
-/// sequence 1 with the named `(incarnation, state)` — an explicit
-/// operator action behind the tool's own review gate, never a boot-read
-/// repair (no read path formats over anything). `INVALID` for a state
-/// code outside the lifecycle; [`CORRUPT`] when the store's copies are
-/// rotted (the law: the tool never repairs a bad checksum either —
-/// delete the file to re-seed).
+/// The `lunet_locks_nuke` admin tool's deliberate reset: re-format the
+/// marker file FRESH at sequence 1 with the named `(incarnation,
+/// state)` — the operator's explicit intent, outside the never-self-heal
+/// rule (a commanded write over a corrupt block is the operator's own
+/// call). It reads nothing first: a corrupt store resets exactly like a
+/// healthy one, and the corrupt bytes stand until the reset lands. The
+/// boot-path [`write`]/[`classify`] refusal is unchanged — the
+/// never-self-heal rule governs every read, never the operator's
+/// deliberate reset. `INVALID` for a state code outside the lifecycle;
+/// every storage failure surfaces as the FFI code.
 pub fn format(path: &std::path::Path, incarnation: u64, state: MarkerState) -> Result<(), i32> {
     let bytes = path.as_os_str().as_encoded_bytes();
     let rc =

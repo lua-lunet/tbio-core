@@ -61,19 +61,19 @@ unsafe extern "C" {
     pub fn lunet_aof_iter_close(it: *mut AofIterRaw);
 
     /// The marker store's per-copy raw facts (read-only, never
-    /// classified): the `nuke` tool's view of the four copies —
-    /// presence, checksum status, sequence, state code, incarnation.
-    /// `out` holds `copies_count` entries (from `geometry`).
+    /// classified): the `lunet_locks_nuke` admin tool's view of the
+    /// four copies — presence, checksum status, sequence, state code,
+    /// incarnation. `out` holds `copies_count` entries (from `geometry`).
     pub fn lunet_aof_marker_inspect(
         path_data: *const u8,
         path_len: usize,
         out: *mut CopyInfoRaw,
     ) -> i32;
 
-    /// The nuke tool's deliberate reset: re-format the marker file FRESH
-    /// at sequence 1 with the named `(incarnation, state)` — an explicit
-    /// operator action behind the tool's own review gate, never a
-    /// boot-read repair.
+    /// The `lunet_locks_nuke` admin tool's deliberate reset: re-format
+    /// the marker file FRESH at sequence 1 with the named
+    /// `(incarnation, state)` — an explicit operator action behind the
+    /// tool's own review gate, never a boot-read repair.
     pub fn lunet_aof_marker_format(
         path_data: *const u8,
         path_len: usize,
