@@ -21,10 +21,12 @@
 //! entry.
 const std = @import("std");
 const assert = std.debug.assert;
+const mem = std.mem;
 
 const aof = @import("aof.zig");
 const constants = @import("constants.zig");
 const marker = @import("marker.zig");
+const superblock = @import("vsr/superblock.zig");
 const vsr = @import("vsr.zig");
 const io_backend = @import("io.zig");
 
@@ -62,6 +64,11 @@ pub const OK: i32 = 0;
 pub const INVALID: i32 = -1;
 pub const TOO_LARGE: i32 = -6;
 pub const SERVICE: i32 = -7;
+/// A readable marker copy failed its checksum: the boot-read law's
+/// refusal (the Zig store's `error.ChecksumRot`). Distinct so the host
+/// adapter can PANIC on it — a bad block is a loud log and a panic,
+/// never a hang, never a clear, never a repair, never a fallback.
+pub const CORRUPT: i32 = -11;
 
 /// Open (create or open, never truncate) an AOF file at `path`.
 ///
@@ -380,6 +387,103 @@ export fn lunet_aof_marker_classify(
 fn marker_error(err: anyerror) i32 {
     return switch (err) {
         error.IncarnationRegressed => INVALID,
+        // Checksum-class corruption (a rotted checksum, or a
+        // checksum-valid copy whose state string disagrees with its
+        // numeric state): the boot-read law's distinct code — the host
+        // adapter panics on it.
+        error.ChecksumRot, error.StateStringDisagreement => CORRUPT,
         else => SERVICE,
     };
+}
+
+/// The byte offset of the marker header's on-disk state string (the
+/// fixed-width, space-padded name) within one copy zone: where a raw
+/// hexdump of a written block reads the state. The offset of the vendored
+/// header's `state_string` field, exported so a C-ABI host never
+/// hard-codes the vendored layout.
+export fn lunet_aof_marker_state_string_offset() usize {
+    return @offsetOf(superblock.SuperBlockHeader, "state_string");
+}
+
+/// One copy's raw facts for the inspect export: everything the
+/// `lunet_locks_nuke` admin tool prints about the marker store's copies.
+/// Pure diagnostics — the store itself is never mutated by an inspect.
+pub const CopyInfo = extern struct {
+    /// The zone read a full header.
+    readable: u8,
+    /// The header's checksum verifies (only meaningful when readable).
+    valid_checksum: u8,
+    sequence: u64,
+    /// The raw lifecycle-state code (may be outside the lifecycle).
+    state: u32,
+    incarnation: u64,
+    checksum_lo: u64,
+    checksum_hi: u64,
+};
+
+/// The marker store's per-copy raw facts (read-only, never classified):
+/// the `lunet_locks_nuke` admin tool's view of the four copies —
+/// presence, checksum status, sequence, state code, incarnation. Missing
+/// zones read as `readable = 0` with the remaining fields zero. A missing
+/// file reports SERVICE; the caller distinguishes with its own existence
+/// check.
+export fn lunet_aof_marker_inspect(
+    path_data: [*]const u8,
+    path_len: usize,
+    out: [*]CopyInfo,
+) i32 {
+    if (path_len == 0 or path_len > std.fs.max_path_bytes) return INVALID;
+    const path = path_data[0..path_len];
+    const file = std.fs.cwd().openFile(path, .{}) catch return SERVICE;
+    defer file.close();
+
+    const header = std.heap.c_allocator.alignedAlloc(
+        superblock.SuperBlockHeader,
+        constants.sector_size,
+        1,
+    ) catch return SERVICE;
+    defer std.heap.c_allocator.free(header);
+
+    for (0..marker.copies_count) |index| {
+        const bytes = mem.asBytes(&header[0]);
+        const read = file.preadAll(bytes, marker.copy_size * index) catch return SERVICE;
+        if (read < marker.copy_header_bytes) {
+            out[index] = mem.zeroes(CopyInfo);
+            continue;
+        }
+        out[index] = .{
+            .readable = 1,
+            .valid_checksum = @intFromBool(header[0].valid_checksum()),
+            .sequence = header[0].sequence,
+            .state = header[0].vsr_state.sync_view,
+            .incarnation = header[0].vsr_state.commit_max,
+            .checksum_lo = @truncate(header[0].checksum),
+            .checksum_hi = @truncate(header[0].checksum >> 64),
+        };
+    }
+    return OK;
+}
+
+/// The `lunet_locks_nuke` admin tool's deliberate reset: re-format the marker file FRESH at
+/// sequence 1 with the named `(incarnation, state)` — four copies,
+/// forced I/O, verify read-back. An explicit operator action (the tool's
+/// own review gate confirms it), never a boot-read repair: no read path
+/// formats over anything. INVALID for a state code outside the
+/// lifecycle; CORRUPT/SERVICE per the store's refusals.
+export fn lunet_aof_marker_format(
+    path_data: [*]const u8,
+    path_len: usize,
+    incarnation: u64,
+    state: u32,
+) i32 {
+    if (path_len == 0 or path_len > std.fs.max_path_bytes) return INVALID;
+    const marker_state = marker.State.from_code(state) orelse return INVALID;
+    const path = path_data[0..path_len];
+
+    var store = marker.MarkerStore.open(path, std.heap.c_allocator) catch |err| {
+        return marker_error(err);
+    };
+    defer store.close(std.heap.c_allocator);
+    store.format(incarnation, marker_state) catch |err| return marker_error(err);
+    return OK;
 }

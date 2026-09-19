@@ -87,7 +87,18 @@ pub const SuperBlockHeader = extern struct {
     /// The number of headers in view_headers_all.
     view_headers_count: u32,
 
-    reserved: [1940]u8 = @splat(0),
+    /// The lifecycle state's fixed-width, space-padded name, stamped by
+    /// the marker store (`marker.zig`) from the same const table the
+    /// numeric state field (`vsr_state.sync_view`) uses, so the two can
+    /// never disagree: a hexdump reads the state directly
+    /// (`"unflushed      "` / `"stopped         "` / `"flushed         "`).
+    /// Non-marker superblocks carry zeroes. Inside the header checksum:
+    /// the name is tamper-evident as a whole, and the store's read treats
+    /// a checksum-valid copy whose name disagrees with its numeric state
+    /// as corruption (the boot-read law: refuse loud, never heal).
+    state_string: [SuperBlockHeader.state_string_len]u8 = @splat(0),
+
+    reserved: [1940 - SuperBlockHeader.state_string_len]u8 = @splat(0),
 
     /// View/JV header suffix. Headers are ordered from high-to-low op.
     /// Unoccupied headers (after view_headers_count) are zeroed.
@@ -96,6 +107,9 @@ pub const SuperBlockHeader = extern struct {
     /// When `vsr_state.log_view = vsr_state.view`, the headers are for a View.
     view_headers_all: [constants.view_headers_max]vsr.Header.Prepare,
     view_headers_reserved: [view_headers_reserved_size]u8 = @splat(0),
+
+    /// The state string's fixed width (the names are space-padded to it).
+    pub const state_string_len: usize = 16;
 
     comptime {
         assert(@sizeOf(SuperBlockHeader) % constants.sector_size == 0);
