@@ -33,7 +33,16 @@ fn main() {
         } else {
             format!("-Dtarget={target}")
         };
-        let cpu_flag = if target.starts_with("x86_64") {
+        // The vendored checksum asserts AES hardware at comptime
+        // (vsr/checksum.zig): x86_64 needs aes AND avx for the impl path,
+        // aarch64 needs aes alone. An explicit LUNET_LOCKS_AOF_TARGET
+        // names the architecture; a native build reads the cargo target
+        // arch, since "native" on an amd64 host still needs +avx.
+        let native_arch =
+            std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| String::new());
+        let cpu_flag = if target.starts_with("x86_64")
+            || (target == "native" && native_arch == "x86_64")
+        {
             "-Dcpu=baseline+aes+avx".to_string()
         } else {
             "-Dcpu=baseline+aes".to_string()
