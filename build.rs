@@ -26,8 +26,23 @@ fn main() {
         } else {
             "-Doptimize=Debug"
         };
-        let target =
-            std::env::var("LUNET_LOCKS_AOF_TARGET").unwrap_or_else(|_| "native".to_string());
+        let target = std::env::var("LUNET_LOCKS_AOF_TARGET").unwrap_or_else(|_| {
+            // An explicit triple, never "native": the native build
+            // links the build runner against the host SDK, which
+            // varies per CI image (the macOS runners link without
+            // libSystem); an explicit triple takes Zig's vendored
+            // libc for the target, the path every publish lane
+            // already proves. The triple maps from the cargo target.
+            let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| String::new());
+            let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| String::new());
+            match (arch.as_str(), os.as_str()) {
+                ("x86_64", "linux") => "x86_64-linux-gnu".to_string(),
+                ("aarch64", "linux") => "aarch64-linux-gnu".to_string(),
+                ("x86_64", "macos") => "x86_64-macos".to_string(),
+                ("aarch64", "macos") => "aarch64-macos".to_string(),
+                _ => "native".to_string(),
+            }
+        });
         let target_flag = if target == "native" {
             "-Dtarget=native".to_string()
         } else {
@@ -35,16 +50,12 @@ fn main() {
         };
         // The vendored checksum asserts AES hardware at comptime
         // (vsr/checksum.zig): x86_64 needs aes AND avx for the impl path,
-        // aarch64 needs aes alone. An explicit LUNET_LOCKS_AOF_TARGET
-        // names the architecture; a native build reads the cargo target
-        // arch, since "native" on an amd64 host still needs +avx.
-        let native_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| String::new());
-        let cpu_flag =
-            if target.starts_with("x86_64") || (target == "native" && native_arch == "x86_64") {
-                "-Dcpu=baseline+aes+avx".to_string()
-            } else {
-                "-Dcpu=baseline+aes".to_string()
-            };
+        // aarch64 needs aes alone.
+        let cpu_flag = if target.starts_with("x86_64") {
+            "-Dcpu=baseline+aes+avx".to_string()
+        } else {
+            "-Dcpu=baseline+aes".to_string()
+        };
         let args = vec![
             "build".to_string(),
             optimize.to_string(),
