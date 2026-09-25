@@ -24,6 +24,11 @@ pub const SERVICE: i32 = -7;
 /// adapter can PANIC on it — a bad block is a loud log and a panic,
 /// never a hang, never a clear, never a repair, never a fallback.
 pub const CORRUPT: i32 = -11;
+/// The marker file's format version is not the current one: an
+/// old-format marker is invalid, never converted (the marker format's
+/// bumps are legacy-free). Distinct so the host can tell "you are
+/// pointing at an old-format marker" apart from rot.
+pub const INCOMPATIBLE: i32 = -12;
 
 unsafe extern "C" {
     pub fn lunet_aof_open(
@@ -63,7 +68,7 @@ unsafe extern "C" {
     /// The marker store's per-copy raw facts (read-only, never
     /// classified): the `lunet_locks_nuke` admin tool's view of the
     /// four copies — presence, checksum status, sequence, state code,
-    /// incarnation. `out` holds `copies_count` entries (from `geometry`).
+    /// identity pair. `out` holds `copies_count` entries (from `geometry`).
     pub fn lunet_aof_marker_inspect(
         path_data: *const u8,
         path_len: usize,
@@ -72,12 +77,13 @@ unsafe extern "C" {
 
     /// The `lunet_locks_nuke` admin tool's deliberate reset: re-format
     /// the marker file FRESH at sequence 1 with the named
-    /// `(incarnation, state)` — an explicit operator action behind the
-    /// tool's own review gate, never a boot-read repair.
+    /// `(node, state)` — the packed identity pair, an explicit operator
+    /// action behind the tool's own review gate, never a boot-read
+    /// repair.
     pub fn lunet_aof_marker_format(
         path_data: *const u8,
         path_len: usize,
-        incarnation: u64,
+        node: u32,
         state: u32,
     ) -> i32;
 }
@@ -93,7 +99,10 @@ pub struct CopyInfoRaw {
     pub sequence: u64,
     /// The raw lifecycle-state code (may be outside the lifecycle).
     pub state: u32,
-    pub incarnation: u64,
+    /// The packed identity pair (MSB system, LSB crash) as the copy
+    /// carries it — a zero half on a checksum-valid copy is corruption
+    /// (the read paths refuse; the inspect reports the raw fact).
+    pub node: u32,
     pub checksum_lo: u64,
     pub checksum_hi: u64,
 }

@@ -69,6 +69,11 @@ pub const SERVICE: i32 = -7;
 /// adapter can PANIC on it — a bad block is a loud log and a panic,
 /// never a hang, never a clear, never a repair, never a fallback.
 pub const CORRUPT: i32 = -11;
+/// The marker file's format version is not the current one: an
+/// old-format marker is invalid, never converted (the marker format's
+/// bumps are legacy-free). Distinct so the host can tell "you are
+/// pointing at an old-format marker" apart from rot.
+pub const INCOMPATIBLE: i32 = -12;
 
 /// Open (create or open, never truncate) an AOF file at `path`.
 ///
@@ -335,40 +340,52 @@ export fn lunet_aof_marker_geometry(
     return OK;
 }
 
-/// One lifecycle transition: quorum-write `(incarnation, state)` into the
+/// One lifecycle transition: quorum-write `(node, state)` into the
 /// marker file at `path` (creating it, never truncating it), forced I/O,
-/// verify read-back. Returns INVALID for a state code outside the
-/// lifecycle or an incarnation that would regress the marker; SERVICE for
-/// every storage-level failure (quorum lost, fork, I/O).
+/// verify read-back — one completable marker round (the fsync lands
+/// before the call reports success), the act a host completes before its
+/// first emission. `node` is the packed identity pair
+/// {systemIdentifier, crashCounter} (MSB system, LSB crash): the halves
+/// never cross the ABI individually, and a zero half refuses at the edge
+/// (the pair is one-indexed). Returns INVALID for a state code outside
+/// the lifecycle, a zero identity half, or a crash counter that would
+/// regress the marker; CORRUPT for a different system identifier on an
+/// existing marker (corruption, not an overwrite); SERVICE for every
+/// storage-level failure (quorum lost, fork, I/O).
 export fn lunet_aof_marker_write(
     path_data: [*]const u8,
     path_len: usize,
-    incarnation: u64,
+    node: u32,
     state: u32,
 ) i32 {
     if (path_len == 0 or path_len > std.fs.max_path_bytes) return INVALID;
     const marker_state = marker.State.from_code(state) orelse return INVALID;
+    const system = marker.system_of(node);
+    const crash = marker.crash_of(node);
+    if (system == 0 or crash == 0) return INVALID;
     const path = path_data[0..path_len];
 
     var store = marker.MarkerStore.open(path, std.heap.c_allocator) catch |err| {
         return marker_error(err);
     };
     defer store.close(std.heap.c_allocator);
-    store.write(incarnation, marker_state) catch |err| return marker_error(err);
+    store.write(system, crash, marker_state) catch |err| return marker_error(err);
     return OK;
 }
 
 /// The boot classification: read the marker's working quorum (the
-/// `.open` threshold) and report its `(incarnation, state)`. The caller
-/// classifies: `stopped`/`flushed` → a clean continue under the same
-/// incarnation; `unflushed` → the running sentinel → a DIRTY bump.
-/// SERVICE covers every unreadable-marker shape (no quorum, fork,
-/// rotted copies) — the caller refuses the boot rather than guessing an
-/// identity, exactly as it does for an unreadable single-file marker.
+/// `.open` threshold) and report its `(node, state)` — the packed
+/// identity pair and the lifecycle state. The caller classifies:
+/// `stopped`/`flushed` → a clean continue under the same identity;
+/// `unflushed` → the running sentinel → a DIRTY bump (one marker write,
+/// durable before the first emission — the host's flush-before-announce
+/// gate is exactly one `lunet_aof_marker_write` call). SERVICE covers
+/// every unreadable-marker shape (no quorum, fork, rotted copies) — the
+/// caller refuses the boot rather than guessing an identity.
 export fn lunet_aof_marker_classify(
     path_data: [*]const u8,
     path_len: usize,
-    out_incarnation: *u64,
+    out_node: *u32,
     out_state: *u32,
 ) i32 {
     if (path_len == 0 or path_len > std.fs.max_path_bytes) return INVALID;
@@ -379,14 +396,23 @@ export fn lunet_aof_marker_classify(
     };
     defer store.close(std.heap.c_allocator);
     const classified = store.classify() catch |err| return marker_error(err);
-    out_incarnation.* = classified.incarnation;
+    out_node.* = marker.pack(classified.system, classified.crash);
     out_state.* = @intFromEnum(classified.state);
     return OK;
 }
 
 fn marker_error(err: anyerror) i32 {
     return switch (err) {
-        error.IncarnationRegressed => INVALID,
+        error.CrashCounterRegressed => INVALID,
+        // A zero identity half refused at the write's edge (the pair is
+        // one-indexed): the caller's mistake, not the store's.
+        error.ZeroIdentity => INVALID,
+        // A different system identifier on an existing marker:
+        // corruption, not an overwrite — the boot-read law's distinct
+        // code, the host adapter panics on it.
+        error.SystemMismatch => CORRUPT,
+        // An old-format marker is invalid, never converted (legacy-free).
+        error.IncompatibleVersion => INCOMPATIBLE,
         // Checksum-class corruption (a rotted checksum, or a
         // checksum-valid copy whose state string disagrees with its
         // numeric state): the boot-read law's distinct code — the host
@@ -416,17 +442,20 @@ pub const CopyInfo = extern struct {
     sequence: u64,
     /// The raw lifecycle-state code (may be outside the lifecycle).
     state: u32,
-    incarnation: u64,
+    /// The packed identity pair (MSB system, LSB crash) as the copy
+    /// carries it — a zero half on a checksum-valid copy is corruption
+    /// (the read paths refuse; the inspect reports the raw fact).
+    node: u32,
     checksum_lo: u64,
     checksum_hi: u64,
 };
 
-/// The marker store's per-copy raw facts (read-only, never classified):
-/// the `lunet_locks_nuke` admin tool's view of the four copies —
-/// presence, checksum status, sequence, state code, incarnation. Missing
-/// zones read as `readable = 0` with the remaining fields zero. A missing
-/// file reports SERVICE; the caller distinguishes with its own existence
-/// check.
+/// The marker store's per-copy raw facts (read-only, never
+/// classified): the `lunet_locks_nuke` admin tool's view of the four
+/// copies — presence, checksum status, sequence, state code, identity
+/// pair. Missing zones read as `readable = 0` with the remaining fields
+/// zero. A missing file reports SERVICE; the caller distinguishes with
+/// its own existence check.
 export fn lunet_aof_marker_inspect(
     path_data: [*]const u8,
     path_len: usize,
@@ -456,7 +485,7 @@ export fn lunet_aof_marker_inspect(
             .valid_checksum = @intFromBool(header[0].valid_checksum()),
             .sequence = header[0].sequence,
             .state = header[0].vsr_state.sync_view,
-            .incarnation = header[0].vsr_state.commit_max,
+            .node = marker.pack(header[0].system_identifier, header[0].crash_counter),
             .checksum_lo = @truncate(header[0].checksum),
             .checksum_hi = @truncate(header[0].checksum >> 64),
         };
@@ -465,25 +494,30 @@ export fn lunet_aof_marker_inspect(
 }
 
 /// The `lunet_locks_nuke` admin tool's deliberate reset: re-format the marker file FRESH at
-/// sequence 1 with the named `(incarnation, state)` — four copies,
+/// sequence 1 with the named `(node, state)` — four copies,
 /// forced I/O, verify read-back. An explicit operator action (the tool's
 /// own review gate confirms it), never a boot-read repair: no read path
-/// formats over anything. INVALID for a state code outside the
-/// lifecycle; CORRUPT/SERVICE per the store's refusals.
+/// formats over anything, and the reset is the one path that re-seats a
+/// marker to a different system identifier. INVALID for a state code
+/// outside the lifecycle or a zero identity half; CORRUPT/SERVICE per
+/// the store's refusals.
 export fn lunet_aof_marker_format(
     path_data: [*]const u8,
     path_len: usize,
-    incarnation: u64,
+    node: u32,
     state: u32,
 ) i32 {
     if (path_len == 0 or path_len > std.fs.max_path_bytes) return INVALID;
     const marker_state = marker.State.from_code(state) orelse return INVALID;
+    const system = marker.system_of(node);
+    const crash = marker.crash_of(node);
+    if (system == 0 or crash == 0) return INVALID;
     const path = path_data[0..path_len];
 
     var store = marker.MarkerStore.open(path, std.heap.c_allocator) catch |err| {
         return marker_error(err);
     };
     defer store.close(std.heap.c_allocator);
-    store.format(incarnation, marker_state) catch |err| return marker_error(err);
+    store.format(system, crash, marker_state) catch |err| return marker_error(err);
     return OK;
 }

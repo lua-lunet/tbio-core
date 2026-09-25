@@ -34,6 +34,7 @@
 //! its own file per call).
 
 use std::io;
+use std::num::NonZeroU16;
 
 /// The FFI code the store refuses with when a readable copy fails its
 /// checksum (the Zig side's `error.ChecksumRot`): THE BOOT-READ LAW's
@@ -43,6 +44,75 @@ use std::io;
 /// refuses with this code and the panic lives in the host process where
 /// the boot gate runs).
 pub const CORRUPT: i32 = crate::ffi::CORRUPT;
+
+/// The FFI code for an old-format marker: the marker format's version
+/// bumps are legacy-free, an old-format marker file is invalid, never
+/// converted. Distinct so the host can tell "you are pointing at an
+/// old-format marker" apart from rot.
+pub const INCOMPATIBLE: i32 = crate::ffi::INCOMPATIBLE;
+
+/// The node identity the marker carries natively: the pair
+/// `{systemIdentifier, crashCounter}` — the identity law's node identity
+/// (uvrr-core v0.8.0, the boot-gate doc): universally unique, durable
+/// before use, never recycled. BOTH HALVES ARE ONE-INDEXED and zero is
+/// never a legal read of either half — the type refuses it by
+/// construction, so an uninitialised or corrupt pair cannot be spelled.
+///
+/// The sysadmin's identifier is burnt in before first boot (system 1 is
+/// the first one); the genesis life carries crash counter one, and every
+/// new life bumps it, durable before the first emission — the crash bump
+/// is one completable marker round ([`write`], the quorum write with
+/// forced I/O).
+///
+/// The packed u32 (`packed()`, MSB system, LSB crash — 65536 systems ×
+/// 65536 lives each) is the wire form hosts derive: the halves never
+/// cross the C ABI individually, the pair (packed) does. The packing is
+/// injective on the one-indexed domain — as is the multiplicative
+/// `system * 2^k + crash` band the uvrr-core Lean proof reasons in — so
+/// the no-overlap property transfers between the encodings, and the
+/// packed word's integer order agrees with the pair's lexicographic
+/// order on every valid pair. (The marker's regress guard compares the
+/// components — same system, strictly advancing counter — never the
+/// packed value, so the ordering is moot.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeIdentity {
+    system_identifier: NonZeroU16,
+    crash_counter: NonZeroU16,
+}
+
+impl NodeIdentity {
+    /// The pair from its halves, or `None` for a zero half: zero is
+    /// never a legal identity, refused where the value enters.
+    pub fn new(system_identifier: u16, crash_counter: u16) -> Option<Self> {
+        Some(Self {
+            system_identifier: NonZeroU16::new(system_identifier)?,
+            crash_counter: NonZeroU16::new(crash_counter)?,
+        })
+    }
+
+    /// The sysadmin-assigned system identifier (one-indexed).
+    pub const fn system_identifier(&self) -> u16 {
+        self.system_identifier.get()
+    }
+
+    /// The crash counter — the life's number, one-indexed (the genesis
+    /// life carries one; every new life strictly advances it).
+    pub const fn crash_counter(&self) -> u16 {
+        self.crash_counter.get()
+    }
+
+    /// The packed wire form: MSB system, LSB crash — the u32 a hexdump
+    /// reads as two `SSSS CCCC` halves.
+    pub const fn packed(&self) -> u32 {
+        ((self.system_identifier.get() as u32) << 16) | self.crash_counter.get() as u32
+    }
+
+    /// The pair from its packed wire form, or `None` for a zero half —
+    /// bytes entering from outside get the same validation.
+    pub fn from_packed(packed: u32) -> Option<Self> {
+        Self::new((packed >> 16) as u16, packed as u16)
+    }
+}
 
 /// The marker zone geometry, reported by the Zig side (the vendored
 /// superblock layout, not hard-coded here).
@@ -137,11 +207,11 @@ pub const fn state_string_padded(code: u32) -> Option<[u8; STATE_STRING_LEN]> {
 }
 
 /// A boot classification: the working quorum's lifecycle state and the
-/// replica's incarnation.
+/// replica's native node identity (the pair — see [`NodeIdentity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Classified {
     pub state: MarkerState,
-    pub incarnation: u64,
+    pub identity: NodeIdentity,
 }
 
 unsafe extern "C" {
@@ -149,16 +219,11 @@ unsafe extern "C" {
     /// The byte offset of the on-disk state string within one copy zone
     /// (the vendored header's `state_string` field).
     fn lunet_aof_marker_state_string_offset() -> usize;
-    fn lunet_aof_marker_write(
-        path_data: *const u8,
-        path_len: usize,
-        incarnation: u64,
-        state: u32,
-    ) -> i32;
+    fn lunet_aof_marker_write(path_data: *const u8, path_len: usize, node: u32, state: u32) -> i32;
     fn lunet_aof_marker_classify(
         path_data: *const u8,
         path_len: usize,
-        out_incarnation: *mut u64,
+        out_node: *mut u32,
         out_state: *mut u32,
     ) -> i32;
     fn lunet_aof_marker_inspect(
@@ -166,12 +231,8 @@ unsafe extern "C" {
         path_len: usize,
         out: *mut crate::ffi::CopyInfoRaw,
     ) -> i32;
-    fn lunet_aof_marker_format(
-        path_data: *const u8,
-        path_len: usize,
-        incarnation: u64,
-        state: u32,
-    ) -> i32;
+    fn lunet_aof_marker_format(path_data: *const u8, path_len: usize, node: u32, state: u32)
+    -> i32;
 }
 
 /// The marker zone geometry (copy count, per-copy byte size).
@@ -193,15 +254,28 @@ pub fn state_string_offset() -> usize {
     unsafe { lunet_aof_marker_state_string_offset() }
 }
 
-/// One lifecycle transition: quorum-write `(incarnation, state)` into the
+/// One lifecycle transition: quorum-write `(identity, state)` into the
 /// marker file at `path` (creating it, never truncating it), forced I/O,
-/// verify read-back. `INVALID` codes (a state outside the lifecycle, an
-/// incarnation that would regress the marker) and every storage failure
-/// surface as the FFI code.
-pub fn write(path: &std::path::Path, incarnation: u64, state: MarkerState) -> Result<(), i32> {
+/// verify read-back. THE CRASH BUMP IS ONE COMPLETABLE MARKER ROUND: the
+/// fsync lands before the call reports success, so a host's
+/// flush-before-announce gate is exactly this one call — the ordering
+/// obligation (durable before first emission) is the host's to sequence,
+/// the library's duty is that the round's pair semantics are enforced
+/// inside it. `INVALID` codes (a state outside the lifecycle, a zero
+/// identity half — unspellable through [`NodeIdentity`], but refused at
+/// the edge regardless — a crash counter that would regress the marker);
+/// `CORRUPT` for a different system identifier on an existing marker
+/// (corruption, not an overwrite); every storage failure surfaces as the
+/// FFI code.
+pub fn write(
+    path: &std::path::Path,
+    identity: NodeIdentity,
+    state: MarkerState,
+) -> Result<(), i32> {
     let bytes = path.as_os_str().as_encoded_bytes();
-    let rc =
-        unsafe { lunet_aof_marker_write(bytes.as_ptr(), bytes.len(), incarnation, state.code()) };
+    let rc = unsafe {
+        lunet_aof_marker_write(bytes.as_ptr(), bytes.len(), identity.packed(), state.code())
+    };
     if rc == crate::ffi::OK {
         Ok(())
     } else {
@@ -210,31 +284,43 @@ pub fn write(path: &std::path::Path, incarnation: u64, state: MarkerState) -> Re
 }
 
 /// The boot classification: read the marker's working quorum and report
-/// its `(incarnation, state)`. Every readable copy's checksum is
+/// its `(identity, state)`. Every readable copy's checksum is
 /// validated before any classification logic: a checksum failure on ANY
 /// copy surfaces as [`CORRUPT`] — the boot-read law (the adapter panics
-/// on it; never cleared, never repaired, never fallen back). Any other
+/// on it; never cleared, never repaired, never fallen back). An
+/// old-format marker (the format version bumps are legacy-free) surfaces
+/// as [`INCOMPATIBLE`] — invalid, never converted. Any other
 /// unreadable-marker shape (no quorum, a fork) is an error — the caller
 /// refuses rather than guessing an identity.
 pub fn classify(path: &std::path::Path) -> Result<Classified, i32> {
     let bytes = path.as_os_str().as_encoded_bytes();
-    let mut incarnation: u64 = 0;
+    let mut node: u32 = 0;
     let mut state: u32 = 0;
-    let rc = unsafe {
-        lunet_aof_marker_classify(bytes.as_ptr(), bytes.len(), &mut incarnation, &mut state)
-    };
+    let rc =
+        unsafe { lunet_aof_marker_classify(bytes.as_ptr(), bytes.len(), &mut node, &mut state) };
     if rc != crate::ffi::OK {
         return Err(rc);
     }
     let state = MarkerState::from_code(state).ok_or(crate::ffi::SERVICE)?;
-    Ok(Classified { state, incarnation })
+    let identity = NodeIdentity::from_packed(node).ok_or(crate::ffi::SERVICE)?;
+    Ok(Classified { state, identity })
 }
 
 /// One copy's raw facts as the store's inspect export reports them: the
 /// `lunet_locks_nuke` admin tool's view of the marker store's four
-/// copies — presence, checksum status, sequence, state code, incarnation.
-/// Pure diagnostics: an inspect never mutates the store.
+/// copies — presence, checksum status, sequence, state code, identity
+/// pair. Pure diagnostics: an inspect never mutates the store.
 pub type CopyInfo = crate::ffi::CopyInfoRaw;
+
+impl CopyInfo {
+    /// The copy's identity pair decoded from the packed wire form, or
+    /// `None` when the raw fact is not a legal identity (a zero half on
+    /// a checksum-valid copy is corruption — the read paths refuse; the
+    /// inspect reports the raw fact).
+    pub fn identity(&self) -> Option<NodeIdentity> {
+        NodeIdentity::from_packed(self.node)
+    }
+}
 
 /// The marker store's per-copy raw facts, read-only and never
 /// classified: a missing or unreadable file reports SERVICE (the caller
@@ -247,7 +333,7 @@ pub fn inspect(path: &std::path::Path) -> io::Result<Vec<CopyInfo>> {
             valid_checksum: 0,
             sequence: 0,
             state: 0,
-            incarnation: 0,
+            node: 0,
             checksum_lo: 0,
             checksum_hi: 0,
         };
@@ -264,19 +350,27 @@ pub fn inspect(path: &std::path::Path) -> io::Result<Vec<CopyInfo>> {
 }
 
 /// The `lunet_locks_nuke` admin tool's deliberate reset: re-format the
-/// marker file FRESH at sequence 1 with the named `(incarnation,
-/// state)` — the operator's explicit intent, outside the never-self-heal
-/// rule (a commanded write over a corrupt block is the operator's own
-/// call). It reads nothing first: a corrupt store resets exactly like a
-/// healthy one, and the corrupt bytes stand until the reset lands. The
+/// marker file FRESH at sequence 1 with the named `(identity, state)` —
+/// the operator's explicit intent, outside the never-self-heal rule (a
+/// commanded write over a corrupt block is the operator's own call), and
+/// the one path that re-seats a marker to a different system identifier.
+/// It reads nothing first: a corrupt store resets exactly like a healthy
+/// one, and the corrupt bytes stand until the reset lands. The
 /// boot-path [`write`]/[`classify`] refusal is unchanged — the
 /// never-self-heal rule governs every read, never the operator's
-/// deliberate reset. `INVALID` for a state code outside the lifecycle;
-/// every storage failure surfaces as the FFI code.
-pub fn format(path: &std::path::Path, incarnation: u64, state: MarkerState) -> Result<(), i32> {
+/// deliberate reset. `INVALID` for a state code outside the lifecycle or
+/// a zero identity half (unspellable through [`NodeIdentity`], refused
+/// at the edge regardless); every storage failure surfaces as the FFI
+/// code.
+pub fn format(
+    path: &std::path::Path,
+    identity: NodeIdentity,
+    state: MarkerState,
+) -> Result<(), i32> {
     let bytes = path.as_os_str().as_encoded_bytes();
-    let rc =
-        unsafe { lunet_aof_marker_format(bytes.as_ptr(), bytes.len(), incarnation, state.code()) };
+    let rc = unsafe {
+        lunet_aof_marker_format(bytes.as_ptr(), bytes.len(), identity.packed(), state.code())
+    };
     if rc == crate::ffi::OK {
         Ok(())
     } else {

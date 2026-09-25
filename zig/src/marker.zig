@@ -3,7 +3,12 @@
 //! vendored superblock copies.
 //!
 //! The marker records one lifecycle state (the running sentinel, stopped,
-//! flushed) plus the replica's incarnation. Its storage is the vendored
+//! flushed) plus the replica's native node identity: the pair
+//! `{systemIdentifier, crashCounter}` — one-indexed, zero never a legal
+//! read of either half, the pair-aware write guard refusing a cross-system
+//! overwrite and a regressing crash counter (THE IDENTITY LAW, the boot
+//! gate's provenance: uvrr-core v0.8.0, commit `be29396e`). Its storage is
+//! the vendored
 //! TigerBeetle superblock construction, applied the way the contract
 //! describes it (`docs/uvrr-termination-obligations-v0.6.1.md` §4, citing
 //! Lampson & Sturgis 1979 §5.1, "the good, the complete, or the newest"):
@@ -32,9 +37,10 @@
 //!
 //! Where the lifecycle rides the header: the vendored build carries no VSR
 //! state machine, so the marker uses two `VSRState` fields the AOF-only
-//! build never drives — `commit_max` carries the incarnation (monotonic:
-//! a clean continue keeps it, a dirty boot bumps it, so the header's
-//! monotonic checks hold) and `sync_view` (state-sync-only, asserted zero
+//! build never drives — `commit_max` stays zero (the old opaque
+//! `incarnation` carrier is deleted; the identity pair is explicit in the
+//! header's own `system_identifier`/`crash_counter` fields) and
+//! `sync_view` (state-sync-only, asserted zero
 //! nowhere) carries the lifecycle state. Both are inside the header
 //! checksum, so a marker copy is tamper-evident as a whole. A boot
 //! classification reads the working quorum's header: `stopped`/`flushed`
@@ -102,6 +108,37 @@ pub const copy_size = superblock.superblock_copy_size;
 /// The bytes of one copy that the store writes and reads: the header
 /// itself (`copy_size` additionally carries the zone's reserved padding).
 pub const copy_header_bytes = @sizeOf(SuperBlockHeader);
+
+/// The marker's own format version, stamped into the header's `version`
+/// field (the vendored field for exactly this: major breaking changes).
+/// The version bumps legacy-free whenever the marker payload changes —
+/// the identity pair replacing the opaque incarnation bumped it to 1 —
+/// and a readable copy at any other version is refused, never converted:
+/// an old-format marker is invalid, not migratable.
+pub const format_version: u16 = 1;
+
+/// The wire form of the identity pair: the packed u32 NodeId, MSB system,
+/// LSB crash (uvrr-core v0.8.0's packing, 65536 systems × 65536 lives
+/// each). The halves never cross the C ABI individually; the packed pair
+/// does. The packing is injective on the one-indexed domain — as is the
+/// multiplicative `system * 2^k + crash` band the uvrr-core proof reasons
+/// in — so the no-overlap property transfers between the encodings, and
+/// the packed word's integer order agrees with the pair's lexicographic
+/// order on every valid pair (the guard compares the components, never
+/// the packed value, so the ordering is moot).
+pub fn pack(system: u16, crash: u16) u32 {
+    return (@as(u32, system) << 16) | crash;
+}
+
+/// The system half of a packed identity pair.
+pub fn system_of(node: u32) u16 {
+    return @truncate(node >> 16);
+}
+
+/// The crash-counter half of a packed identity pair.
+pub fn crash_of(node: u32) u16 {
+    return @truncate(node);
+}
 
 /// The marker's fixed cluster/replica identity: a marker file is
 /// per-replica local storage, so the identity only needs to be stable,
@@ -192,7 +229,8 @@ fn as_readable_string(bytes: *const [SuperBlockHeader.state_string_len]u8) []con
 
 pub const Classified = struct {
     state: State,
-    incarnation: u64,
+    system: u16,
+    crash: u16,
 };
 
 pub const Error = error{
@@ -219,8 +257,27 @@ pub const Error = error{
     /// same distinct code as `ChecksumRot` and the host adapter panics
     /// on it.
     StateStringDisagreement,
-    /// A write refused: the incarnation would regress the marker.
-    IncarnationRegressed,
+    /// A write refused: the crash counter would regress the marker — a
+    /// same-system write either keeps the counter (the life's own
+    /// stopped/flushed transitions) or strictly advances it (the crash
+    /// bump).
+    CrashCounterRegressed,
+    /// A write refused: a different system identifier on an existing
+    /// marker — corruption, not an overwrite. The marker names one
+    /// system for its whole life on disk; the FFI spells this refusal as
+    /// the corruption code and the host adapter panics on it.
+    SystemMismatch,
+    /// A zero half of the identity pair: never a legal identity
+    /// (one-indexed everywhere; an uninitialised or corrupt marker cannot
+    /// be read as an identity). A write with a zero half refuses at the
+    /// store's edge; a checksum-valid copy reading zero halves is
+    /// corruption — refused loud, never healed, never quorum-decided.
+    ZeroIdentity,
+    /// A readable copy stamped with a marker format version other than
+    /// `format_version`: an old-format marker is invalid, never converted
+    /// (the version bumps are legacy-free). The FFI spells a distinct
+    /// code.
+    IncompatibleVersion,
     /// A write refused: the marker file's copies rotted beyond the read
     /// quorum (delete the file to re-seed from the compatibility
     /// projection).
@@ -238,12 +295,13 @@ pub const Error = error{
 };
 
 /// The working quorum's facts a marker operation needs: the hash-chain
-/// position (sequence, checksum) and the marker payload (incarnation,
+/// position (sequence, checksum) and the marker payload (identity pair,
 /// state).
 const Working = struct {
     sequence: u64,
     checksum: u128,
-    incarnation: u64,
+    system: u16,
+    crash: u16,
     /// The raw lifecycle-state code as read from the working header
     /// (validated into a `State` by `classify`).
     state: u32,
@@ -305,23 +363,32 @@ pub const MarkerStore = struct {
     /// hash-chained from the working quorum), force it durable, verify the
     /// write's read-back quorum. A fresh marker file formats at sequence
     /// 1; an existing one must present a working quorum to chain from.
-    pub fn write(store: *MarkerStore, incarnation: u64, state: State) Error!void {
+    /// THE PAIR-AWARE GUARD: a zero identity half refuses at the edge; on
+    /// an existing marker a different system identifier is corruption
+    /// (`SystemMismatch`), a lower crash counter is a regress
+    /// (`CrashCounterRegressed`), and the crash bump is the strictly
+    /// advancing counter — one completable marker round (the quorum write
+    /// with forced I/O below IS that round) a host completes before its
+    /// first emission.
+    pub fn write(store: *MarkerStore, system: u16, crash: u16, state: State) Error!void {
+        if (system == 0 or crash == 0) return error.ZeroIdentity;
         const current: ?Working = try store.read_working();
         const sequence: u64 = if (current) |w| w.sequence + 1 else 1;
         const parent: u128 = if (current) |w| w.checksum else 0;
         if (current) |w| {
-            if (incarnation < w.incarnation) return error.IncarnationRegressed;
+            if (w.system != system) return error.SystemMismatch;
+            if (crash < w.crash) return error.CrashCounterRegressed;
         }
-        var header = marker_header(incarnation, state, sequence, parent);
+        var header = marker_header(system, crash, state, sequence, parent);
         try store.commit(&header);
     }
 
-    /// The working quorum's classification: the lifecycle state and
-    /// incarnation of the highest-sequence valid quorum.
+    /// The working quorum's classification: the lifecycle state and the
+    /// identity pair of the highest-sequence valid quorum.
     pub fn classify(store: *MarkerStore) Error!Classified {
         const current = try store.read_working() orelse return error.NotFound;
         const state = State.from_code(current.state) orelse return error.InvalidState;
-        return .{ .state = state, .incarnation = current.incarnation };
+        return .{ .state = state, .system = current.system, .crash = current.crash };
     }
 
     /// Reads every copy and resolves the working quorum (the `.open`
@@ -355,17 +422,53 @@ pub const MarkerStore = struct {
                 var word_buf: [32]u8 = undefined;
                 log.warn("marker: copy {}/{}: BAD CHECKSUM — the boot read refuses; " ++
                     "the block is never cleared, never repaired, never quorum-decided " ++
-                    "(checksum={x:0>32} sequence={} state={s} state_string=\"{s}\" incarnation={} copy_field={})", .{
+                    "(checksum={x:0>32} sequence={} state={s} state_string=\"{s}\" system={} crash={} copy_field={})", .{
                     index,
                     copies_count,
                     store.reading[index].checksum,
                     store.reading[index].sequence,
                     state_word(&word_buf, store.reading[index].vsr_state.sync_view),
                     as_readable_string(&store.reading[index].state_string),
-                    store.reading[index].vsr_state.commit_max,
+                    store.reading[index].system_identifier,
+                    store.reading[index].crash_counter,
                     store.reading[index].copy,
                 });
                 return error.ChecksumRot;
+            }
+            // The marker format version: an old-format marker is invalid,
+            // never converted (legacy-free) — refused loud, exactly like
+            // a bad checksum, at the same per-copy edge.
+            if (store.reading[index].version != format_version) {
+                log.warn("marker: copy {}/{}: INCOMPATIBLE FORMAT VERSION {} (the marker " ++
+                    "format is {}, legacy-free: an old-format marker is refused, never " ++
+                    "converted) — the boot read refuses", .{
+                    index,
+                    copies_count,
+                    store.reading[index].version,
+                    format_version,
+                });
+                return error.IncompatibleVersion;
+            }
+            // THE NEVER-READ-AS-ZERO LAW at the disk edge: the identity
+            // pair is one-indexed; a checksum-valid copy reading zero
+            // halves names no identity — corruption, refused loud, never
+            // guessed around.
+            if (store.reading[index].system_identifier == 0 or
+                store.reading[index].crash_counter == 0)
+            {
+                var word_buf: [32]u8 = undefined;
+                log.warn("marker: copy {}/{}: ZERO IDENTITY HALF — the identity pair is " ++
+                    "one-indexed, a zero half is corruption; the boot read refuses, the " ++
+                    "block is never cleared, never repaired, never quorum-decided " ++
+                    "(sequence={} system={} crash={} state={s})", .{
+                    index,
+                    copies_count,
+                    store.reading[index].sequence,
+                    store.reading[index].system_identifier,
+                    store.reading[index].crash_counter,
+                    state_word(&word_buf, store.reading[index].vsr_state.sync_view),
+                });
+                return error.ZeroIdentity;
             }
             // The string half of the state agrees with the numeric half,
             // or the copy is corruption: a checksum-valid copy whose
@@ -379,13 +482,14 @@ pub const MarkerStore = struct {
                     log.warn("marker: copy {}/{}: STATE STRING DISAGREES WITH THE NUMERIC " ++
                         "STATE — checksum-class corruption, the boot read refuses; the block " ++
                         "is never cleared, never repaired, never quorum-decided " ++
-                        "(sequence={} state={s} state_string=\"{s}\" incarnation={})", .{
+                        "(sequence={} state={s} state_string=\"{s}\" system={} crash={})", .{
                         index,
                         copies_count,
                         store.reading[index].sequence,
                         state_name(code).?,
                         as_readable_string(&store.reading[index].state_string),
-                        store.reading[index].vsr_state.commit_max,
+                        store.reading[index].system_identifier,
+                        store.reading[index].crash_counter,
                     });
                     return error.StateStringDisagreement;
                 }
@@ -400,7 +504,8 @@ pub const MarkerStore = struct {
         return .{
             .sequence = quorum.header.sequence,
             .checksum = quorum.header.checksum,
-            .incarnation = quorum.header.vsr_state.commit_max,
+            .system = quorum.header.system_identifier,
+            .crash = quorum.header.crash_counter,
             .state = quorum.header.vsr_state.sync_view,
         };
     }
@@ -424,11 +529,12 @@ pub const MarkerStore = struct {
         var word_buf: [32]u8 = undefined;
         log.warn(
             "marker: NON-UNANIMOUS spread resolved by thresholds: sequence={} " ++
-                "state={s} incarnation={} checksum={x:0>32} carried by {} of {} copies",
+                "state={s} system={} crash={} checksum={x:0>32} carried by {} of {} copies",
             .{
                 quorum.header.sequence,
                 state_word(&word_buf, quorum.header.vsr_state.sync_view),
-                quorum.header.vsr_state.commit_max,
+                quorum.header.system_identifier,
+                quorum.header.crash_counter,
                 quorum.header.checksum,
                 quorum.copies.count(),
                 copies_count,
@@ -444,7 +550,7 @@ pub const MarkerStore = struct {
             var member_word_buf: [32]u8 = undefined;
             const member = quorum.slots[index] != null;
             log.warn(
-                "marker: copy {}/{}: {s} sequence={} state={s} state_string=\"{s}\" incarnation={} " ++
+                "marker: copy {}/{}: {s} sequence={} state={s} state_string=\"{s}\" system={} crash={} " ++
                     "checksum={x:0>32} {s}",
                 .{
                     index,
@@ -453,7 +559,8 @@ pub const MarkerStore = struct {
                     headers[index].sequence,
                     state_word(&member_word_buf, headers[index].vsr_state.sync_view),
                     as_readable_string(&headers[index].state_string),
-                    headers[index].vsr_state.commit_max,
+                    headers[index].system_identifier,
+                    headers[index].crash_counter,
                     headers[index].checksum,
                     if (member)
                         @as([]const u8, "")
@@ -472,7 +579,7 @@ pub const MarkerStore = struct {
     /// resolve to the written header.
     fn commit(store: *MarkerStore, header: *SuperBlockHeader) Error!void {
         assert(header.copy == 0);
-        header.set_checksum();
+        stamp_checksum(header);
         const expected_checksum = header.checksum;
 
         for (0..copies_count) |index| {
@@ -499,13 +606,14 @@ pub const MarkerStore = struct {
                 var word_buf: [32]u8 = undefined;
                 log.warn("marker: copy {}/{}: BAD CHECKSUM at the write's verify read-back — " ++
                     "the write refuses; the block is never cleared, never repaired " ++
-                    "(checksum={x:0>32} sequence={} state={s} incarnation={})", .{
+                    "(checksum={x:0>32} sequence={} state={s} system={} crash={})", .{
                     index,
                     copies_count,
                     store.reading[index].checksum,
                     store.reading[index].sequence,
                     state_word(&word_buf, store.reading[index].vsr_state.sync_view),
-                    store.reading[index].vsr_state.commit_max,
+                    store.reading[index].system_identifier,
+                    store.reading[index].crash_counter,
                 });
                 return error.ChecksumRot;
             }
@@ -516,15 +624,29 @@ pub const MarkerStore = struct {
     }
 
     /// The `lunet_locks_nuke` admin tool's deliberate reset: a FRESH format at sequence 1 —
-    /// four copies of the named `(incarnation, state)`, parent 0, forced
+    /// four copies of the named `(system, crash, state)`, parent 0, forced
     /// I/O, verify read-back. This is an explicit operator action over
     /// the evidence (confirmed by the tool's own review gate), never a
     /// boot-read repair: no read path formats over anything.
-    pub fn format(store: *MarkerStore, incarnation: u64, state: State) Error!void {
-        var header = marker_header(incarnation, state, 1, 0);
+    pub fn format(store: *MarkerStore, system: u16, crash: u16, state: State) Error!void {
+        if (system == 0 or crash == 0) return error.ZeroIdentity;
+        var header = marker_header(system, crash, state, 1, 0);
         try store.commit(&header);
     }
 };
+
+/// The marker's checksum stamp: the vendored header's checksum discipline
+/// (the checksum excludes `checksum`, `checksum_padding`, and `copy`) —
+/// WITHOUT the vendored `version == SuperBlockVersion` assert. The marker
+/// rides the vendored construction but owns its format version
+/// (`format_version`, bumped legacy-free when the payload changes); the
+/// vendored assert would pin the vendored release's version, which is not
+/// the marker format's own counter.
+fn stamp_checksum(header: *SuperBlockHeader) void {
+    assert(header.copy < copies_count);
+    assert(header.copy == 0);
+    header.checksum = header.calculate_checksum();
+}
 
 fn fsync_directory(path: []const u8) Error!void {
     const dirname = std.fs.path.dirname(path) orelse ".";
@@ -544,12 +666,12 @@ fn fsync_directory(path: []const u8) Error!void {
 }
 
 /// The marker header for one lifecycle transition: the vendored superblock
-/// header shape (checksummed as a whole by `set_checksum`), with the
+/// header shape (checksummed as a whole by `stamp_checksum`), with the
 /// marker riding the two `VSRState` fields the AOF-only build never drives
 /// (see the module doc).
-fn marker_header(incarnation: u64, state: State, sequence: u64, parent: u128) SuperBlockHeader {
+fn marker_header(system: u16, crash: u16, state: State, sequence: u64, parent: u128) SuperBlockHeader {
     var header = mem.zeroes(SuperBlockHeader);
-    header.version = superblock.SuperBlockVersion;
+    header.version = format_version;
     header.release_format = vsr.Release.minimum;
     header.cluster = marker_cluster;
     header.sequence = sequence;
@@ -565,9 +687,13 @@ fn marker_header(incarnation: u64, state: State, sequence: u64, parent: u128) Su
         .release = vsr.Release.minimum,
         .view = 0,
     });
-    vsr_state.commit_max = incarnation;
+    // The old opaque incarnation carrier is deleted: commit_max stays
+    // zero, the identity pair is explicit in the header's own fields.
+    vsr_state.commit_max = 0;
     vsr_state.sync_view = @intFromEnum(state);
     header.vsr_state = vsr_state;
+    header.system_identifier = system;
+    header.crash_counter = crash;
     // The readable half of the state: stamped from the same const table
     // the numeric field's names come from, so the block's string and its
     // numeric state can never disagree at write time (the read enforces
@@ -602,18 +728,32 @@ test "marker: quorum write and classify round trip across lifecycle transitions"
     var store = try opened(testing.allocator, file_path);
     defer store.close(testing.allocator);
 
-    // A fresh marker formats at sequence 1.
-    try store.write(7, .unflushed);
-    try testing.expectEqual(Classified{ .state = .unflushed, .incarnation = 7 }, try store.classify());
+    // A fresh marker formats at sequence 1: system 3, genesis life 1.
+    try store.write(3, 1, .unflushed);
+    try testing.expectEqual(
+        Classified{ .state = .unflushed, .system = 3, .crash = 1 },
+        try store.classify(),
+    );
 
-    // Each transition advances the sequence and re-resolves cleanly.
-    try store.write(7, .stopped);
-    try testing.expectEqual(Classified{ .state = .stopped, .incarnation = 7 }, try store.classify());
-    try store.write(7, .flushed);
-    try testing.expectEqual(Classified{ .state = .flushed, .incarnation = 7 }, try store.classify());
-    // A later life's bump: the incarnation advances, the sentinel returns.
-    try store.write(8, .unflushed);
-    try testing.expectEqual(Classified{ .state = .unflushed, .incarnation = 8 }, try store.classify());
+    // Each transition advances the sequence and re-resolves cleanly. The
+    // same life (the same crash counter) carries stopped/flushed.
+    try store.write(3, 1, .stopped);
+    try testing.expectEqual(
+        Classified{ .state = .stopped, .system = 3, .crash = 1 },
+        try store.classify(),
+    );
+    try store.write(3, 1, .flushed);
+    try testing.expectEqual(
+        Classified{ .state = .flushed, .system = 3, .crash = 1 },
+        try store.classify(),
+    );
+    // A later life's bump: the crash counter strictly advances for the
+    // same system, the sentinel returns.
+    try store.write(3, 2, .unflushed);
+    try testing.expectEqual(
+        Classified{ .state = .unflushed, .system = 3, .crash = 2 },
+        try store.classify(),
+    );
 }
 
 test "marker: a fresh file formats; an existing file must present a working quorum" {
@@ -624,16 +764,16 @@ test "marker: a fresh file formats; an existing file must present a working quor
 
     // A store over a fresh (absent) file formats at sequence 1, parent 0.
     var fresh = try opened(testing.allocator, file_path);
-    try fresh.write(3, .flushed);
-    try testing.expectEqual(Classified{ .state = .flushed, .incarnation = 3 }, try fresh.classify());
+    try fresh.write(2, 3, .flushed);
+    try testing.expectEqual(Classified{ .state = .flushed, .system = 2, .crash = 3 }, try fresh.classify());
     fresh.close(testing.allocator);
 
     // Reopening sees the durable copies and chains from them (sequence 3).
     var reopened = try opened(testing.allocator, file_path);
     defer reopened.close(testing.allocator);
-    try reopened.write(4, .unflushed);
+    try reopened.write(2, 4, .unflushed);
     try testing.expectEqual(
-        Classified{ .state = .unflushed, .incarnation = 4 },
+        Classified{ .state = .unflushed, .system = 2, .crash = 4 },
         try reopened.classify(),
     );
 }
@@ -645,7 +785,7 @@ test "marker: a rotted copy fails the read loud (ChecksumRot), never heals" {
     const file_path = try tmp_marker_path(&tmp, &buf);
 
     var store = try opened(testing.allocator, file_path);
-    try store.write(7, .flushed);
+    try store.write(1, 7, .flushed);
     store.close(testing.allocator);
 
     // Rot one copy: garbage over its zone (the checksum must fail).
@@ -671,7 +811,7 @@ test "marker: a rotted copy fails the read loud (ChecksumRot), never heals" {
     var reopened = try opened(testing.allocator, file_path);
     defer reopened.close(testing.allocator);
     try testing.expectError(error.ChecksumRot, reopened.classify());
-    try testing.expectError(error.ChecksumRot, reopened.write(7, .stopped));
+    try testing.expectError(error.ChecksumRot, reopened.write(1, 7, .stopped));
 
     var after: [copy_header_bytes]u8 = undefined;
     {
@@ -689,7 +829,7 @@ test "marker: a torn copy (never fully written) decides nothing" {
     const file_path = try tmp_marker_path(&tmp, &buf);
 
     var store = try opened(testing.allocator, file_path);
-    try store.write(7, .flushed);
+    try store.write(1, 7, .flushed);
     store.close(testing.allocator);
 
     // A torn copy (never fully written: the zone reads short) decides
@@ -701,7 +841,7 @@ test "marker: a torn copy (never fully written) decides nothing" {
     var reopened = try opened(testing.allocator, file_path);
     defer reopened.close(testing.allocator);
     try testing.expectEqual(
-        Classified{ .state = .flushed, .incarnation = 7 },
+        Classified{ .state = .flushed, .system = 1, .crash = 7 },
         try reopened.classify(),
     );
 }
@@ -713,7 +853,7 @@ test "marker: a stale copy cannot drag the classification back (min progress)" {
     const file_path = try tmp_marker_path(&tmp, &buf);
 
     var store = try opened(testing.allocator, file_path);
-    try store.write(5, .unflushed);
+    try store.write(1, 5, .unflushed);
     // Snapshot one copy at the older generation.
     const stale = try testing.allocator.alloc(u8, copy_header_bytes);
     defer testing.allocator.free(stale);
@@ -723,7 +863,7 @@ test "marker: a stale copy cannot drag the classification back (min progress)" {
         _ = try file.preadAll(stale, copy_size * 1);
     }
     // The next transition: the stop path's flush, a full quorum write.
-    try store.write(5, .flushed);
+    try store.write(1, 5, .flushed);
     store.close(testing.allocator);
 
     // Restore one copy to the older generation: a valid, stale copy. The
@@ -736,7 +876,7 @@ test "marker: a stale copy cannot drag the classification back (min progress)" {
     var reopened = try opened(testing.allocator, file_path);
     defer reopened.close(testing.allocator);
     try testing.expectEqual(
-        Classified{ .state = .flushed, .incarnation = 5 },
+        Classified{ .state = .flushed, .system = 1, .crash = 5 },
         try reopened.classify(),
     );
 }
@@ -748,7 +888,7 @@ test "marker: a single advanced copy without a quorum cannot fake a clean stop" 
     const file_path = try tmp_marker_path(&tmp, &buf);
 
     var store = try opened(testing.allocator, file_path);
-    try store.write(5, .unflushed);
+    try store.write(1, 5, .unflushed);
     // Snapshot copies 1..3 of the running sentinel (sequence 1), each to
     // its own buffer (the copies are spaced copy_size apart; the headers
     // are read back per slot).
@@ -764,7 +904,7 @@ test "marker: a single advanced copy without a quorum cannot fake a clean stop" 
             _ = try file.preadAll(&older[index - 1], copy_size * index);
         }
     }
-    try store.write(5, .stopped);
+    try store.write(1, 5, .stopped);
     store.close(testing.allocator);
 
     // A death after exactly ONE copy of the stopped write: restore copies
@@ -780,7 +920,7 @@ test "marker: a single advanced copy without a quorum cannot fake a clean stop" 
     var reopened = try opened(testing.allocator, file_path);
     defer reopened.close(testing.allocator);
     try testing.expectEqual(
-        Classified{ .state = .unflushed, .incarnation = 5 },
+        Classified{ .state = .unflushed, .system = 1, .crash = 5 },
         try reopened.classify(),
     );
 }
@@ -792,7 +932,7 @@ test "marker: a forged fork fails closed" {
     const file_path = try tmp_marker_path(&tmp, &buf);
 
     var store = try opened(testing.allocator, file_path);
-    try store.write(9, .flushed);
+    try store.write(1, 9, .flushed);
     store.close(testing.allocator);
 
     // Forge copy 0: same sequence, contradictory state, recomputed
@@ -809,7 +949,7 @@ test "marker: a forged fork fails closed" {
         assert(forged.copy == 0);
         forged.vsr_state.sync_view = @intFromEnum(State.unflushed);
         forged.state_string = state_strings[@intFromEnum(State.unflushed)];
-        forged.set_checksum();
+        stamp_checksum(&forged);
         try file.pwriteAll(mem.asBytes(&forged), copy_size * 0);
     }
 
@@ -818,17 +958,40 @@ test "marker: a forged fork fails closed" {
     try testing.expectError(error.Fork, reopened.classify());
 }
 
-test "marker: a write refuses a regressing incarnation and a rotted file" {
+test "marker: the pair guard refuses regress, cross-system, and zero halves" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const file_path = try tmp_marker_path(&tmp, &buf);
 
     var store = try opened(testing.allocator, file_path);
-    try store.write(9, .flushed);
-    try testing.expectError(error.IncarnationRegressed, store.write(8, .stopped));
+    // Genesis life: the counter starts at one, a zero half is never a
+    // legal write at the store's edge either.
+    try testing.expectError(error.ZeroIdentity, store.write(0, 5, .flushed));
+    try testing.expectError(error.ZeroIdentity, store.write(5, 0, .flushed));
+    try testing.expectError(error.ZeroIdentity, store.write(0, 0, .flushed));
+
+    try store.write(3, 9, .flushed);
+    // Same system, lower crash counter: a regress, never an overwrite.
+    try testing.expectError(error.CrashCounterRegressed, store.write(3, 8, .stopped));
+    // A different system identifier on an existing marker: corruption,
+    // not an overwrite — whatever the counter claims.
+    try testing.expectError(error.SystemMismatch, store.write(4, 1, .stopped));
+    try testing.expectError(error.SystemMismatch, store.write(4, 10, .stopped));
     try testing.expectEqual(
-        Classified{ .state = .flushed, .incarnation = 9 },
+        Classified{ .state = .flushed, .system = 3, .crash = 9 },
+        try store.classify(),
+    );
+    // Same system, same counter: the life's transitions stay legal; a
+    // strictly advancing counter is the crash bump.
+    try store.write(3, 9, .stopped);
+    try testing.expectEqual(
+        Classified{ .state = .stopped, .system = 3, .crash = 9 },
+        try store.classify(),
+    );
+    try store.write(3, 10, .unflushed);
+    try testing.expectEqual(
+        Classified{ .state = .unflushed, .system = 3, .crash = 10 },
         try store.classify(),
     );
     store.close(testing.allocator);
@@ -844,8 +1007,103 @@ test "marker: a write refuses a regressing incarnation and a rotted file" {
     }
     var rotted = try opened(testing.allocator, file_path);
     defer rotted.close(testing.allocator);
-    try testing.expectError(error.ChecksumRot, rotted.write(9, .stopped));
+    try testing.expectError(error.ChecksumRot, rotted.write(3, 10, .stopped));
     try testing.expectError(error.ChecksumRot, rotted.classify());
+}
+
+// The never-read-as-zero law at the disk edge: a checksum-valid working
+// quorum whose identity halves read zero is corruption — the store
+// refuses (error.ZeroIdentity), never guesses an identity from zeros.
+test "marker: a valid-checksum marker reading zero halves refuses" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = try tmp_marker_path(&tmp, &buf);
+
+    var store = try opened(testing.allocator, file_path);
+    try store.write(3, 9, .flushed);
+    store.close(testing.allocator);
+
+    // Forge ALL copies (one lying copy would fork, not resolve): zero
+    // the identity halves, recompute the checksums — every copy passes
+    // its checksum while naming no identity at all.
+    var file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
+    defer file.close();
+    for (0..copies_count) |index| {
+        var forged: SuperBlockHeader = undefined;
+        _ = try file.preadAll(mem.asBytes(&forged), copy_size * index);
+        forged.system_identifier = 0;
+        forged.crash_counter = 0;
+        forged.copy = 0;
+        stamp_checksum(&forged);
+        forged.copy = @intCast(index);
+        try file.pwriteAll(mem.asBytes(&forged), copy_size * index);
+    }
+
+    var reopened = try opened(testing.allocator, file_path);
+    defer reopened.close(testing.allocator);
+    try testing.expectError(error.ZeroIdentity, reopened.classify());
+    try testing.expectError(error.ZeroIdentity, reopened.write(3, 9, .stopped));
+}
+
+// Legacy-free: the marker format version bumped, an old-format marker
+// (valid checksums, the previous version) is refused, never converted.
+test "marker: an old-format marker refuses loud" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = try tmp_marker_path(&tmp, &buf);
+
+    var store = try opened(testing.allocator, file_path);
+    try store.write(3, 9, .flushed);
+    store.close(testing.allocator);
+
+    // Rewind every copy to the previous format version (valid checksums).
+    var file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
+    defer file.close();
+    for (0..copies_count) |index| {
+        var old: SuperBlockHeader = undefined;
+        _ = try file.preadAll(mem.asBytes(&old), copy_size * index);
+        old.version = format_version - 1;
+        old.copy = 0;
+        stamp_checksum(&old);
+        old.copy = @intCast(index);
+        try file.pwriteAll(mem.asBytes(&old), copy_size * index);
+    }
+
+    var reopened = try opened(testing.allocator, file_path);
+    defer reopened.close(testing.allocator);
+    try testing.expectError(error.IncompatibleVersion, reopened.classify());
+    try testing.expectError(error.IncompatibleVersion, reopened.write(3, 9, .stopped));
+}
+
+// The `lunet_locks_nuke` deliberate reset takes the pair and re-seats
+// the marker to a different system identifier — the one path the guard
+// does not govern (an explicit operator action over the evidence).
+test "marker: format re-seats the marker to a named identity" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = try tmp_marker_path(&tmp, &buf);
+
+    var store = try opened(testing.allocator, file_path);
+    defer store.close(testing.allocator);
+    try store.write(3, 9, .flushed);
+    try store.write(3, 9, .stopped);
+    // The operator's reset: fresh at sequence 1 under a new system.
+    try store.format(4, 1, .unflushed);
+    try testing.expectEqual(
+        Classified{ .state = .unflushed, .system = 4, .crash = 1 },
+        try store.classify(),
+    );
+    // The guard keys on the re-seated system: the old system is now the
+    // foreign one.
+    try testing.expectError(error.SystemMismatch, store.write(3, 9, .stopped));
+    try store.write(4, 1, .stopped);
+    try testing.expectEqual(
+        Classified{ .state = .stopped, .system = 4, .crash = 1 },
+        try store.classify(),
+    );
 }
 
 // The rig's andon shape: the first boot over a wiped state dir. The state
@@ -861,9 +1119,9 @@ test "marker: first boot over a wiped state dir boots clean (empty dir)" {
 
     var store = try opened(testing.allocator, file_path);
     defer store.close(testing.allocator);
-    try store.write(7, .unflushed);
+    try store.write(1, 7, .unflushed);
     try testing.expectEqual(
-        Classified{ .state = .unflushed, .incarnation = 7 },
+        Classified{ .state = .unflushed, .system = 1, .crash = 7 },
         try store.classify(),
     );
 }
@@ -882,9 +1140,9 @@ test "marker: first boot on a missing state dir boots clean (parent created)" {
 
     var store = try opened(testing.allocator, file_path);
     defer store.close(testing.allocator);
-    try store.write(3, .flushed);
+    try store.write(2, 3, .flushed);
     try testing.expectEqual(
-        Classified{ .state = .flushed, .incarnation = 3 },
+        Classified{ .state = .flushed, .system = 2, .crash = 3 },
         try store.classify(),
     );
 }
@@ -901,26 +1159,26 @@ test "marker: a survivor boot over an existing marker chains unchanged" {
     {
         var first = try opened(testing.allocator, file_path);
         defer first.close(testing.allocator);
-        try first.write(5, .unflushed);
+        try first.write(1, 5, .unflushed);
     }
     // The survivor boot: the marker's copies are present, the boot reads
     // them, and the stop path chains from them.
     var survivor = try opened(testing.allocator, file_path);
     defer survivor.close(testing.allocator);
     try testing.expectEqual(
-        Classified{ .state = .unflushed, .incarnation = 5 },
+        Classified{ .state = .unflushed, .system = 1, .crash = 5 },
         try survivor.classify(),
     );
-    try survivor.write(5, .flushed);
+    try survivor.write(1, 5, .flushed);
     try testing.expectEqual(
-        Classified{ .state = .flushed, .incarnation = 5 },
+        Classified{ .state = .flushed, .system = 1, .crash = 5 },
         try survivor.classify(),
     );
     // A third boot over the stopped copies keeps the chain.
     var again = try opened(testing.allocator, file_path);
     defer again.close(testing.allocator);
     try testing.expectEqual(
-        Classified{ .state = .flushed, .incarnation = 5 },
+        Classified{ .state = .flushed, .system = 1, .crash = 5 },
         try again.classify(),
     );
 }
@@ -943,7 +1201,7 @@ test "marker: the block carries the readable state string" {
     for (lifecycle) |state| {
         var store = try opened(testing.allocator, file_path);
         errdefer store.close(testing.allocator);
-        try store.write(7, state);
+        try store.write(1, 7, state);
         store.close(testing.allocator);
 
         var copy: [copy_header_bytes]u8 = undefined;
@@ -964,9 +1222,9 @@ test "marker: the block carries the readable state string" {
     // string is re-stamped from the table, never stale).
     var store = try opened(testing.allocator, file_path);
     defer store.close(testing.allocator);
-    try store.write(8, .flushed);
+    try store.write(1, 8, .flushed);
     try testing.expectEqual(
-        Classified{ .state = .flushed, .incarnation = 8 },
+        Classified{ .state = .flushed, .system = 1, .crash = 8 },
         try store.classify(),
     );
 }
@@ -982,7 +1240,7 @@ test "marker: a forged string/numeric disagreement refuses loud, never heals" {
     const file_path = try tmp_marker_path(&tmp, &buf);
 
     var store = try opened(testing.allocator, file_path);
-    try store.write(9, .flushed);
+    try store.write(1, 9, .flushed);
     store.close(testing.allocator);
 
     // Forge copy 1: the numeric state says `flushed`, the string says
@@ -1001,7 +1259,7 @@ test "marker: a forged string/numeric disagreement refuses loud, never heals" {
         // discipline): zero it for the recompute, restore it for the
         // write-back so the forged copy keeps its zone index.
         forged.copy = 0;
-        forged.set_checksum();
+        stamp_checksum(&forged);
         forged.copy = 1;
         try file.pwriteAll(mem.asBytes(&forged), copy_size * 1);
         _ = try file.preadAll(&before, copy_size * 1);
@@ -1010,7 +1268,7 @@ test "marker: a forged string/numeric disagreement refuses loud, never heals" {
     var reopened = try opened(testing.allocator, file_path);
     defer reopened.close(testing.allocator);
     try testing.expectError(error.StateStringDisagreement, reopened.classify());
-    try testing.expectError(error.StateStringDisagreement, reopened.write(9, .stopped));
+    try testing.expectError(error.StateStringDisagreement, reopened.write(1, 9, .stopped));
 
     var after: [copy_header_bytes]u8 = undefined;
     {
