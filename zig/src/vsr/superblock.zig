@@ -98,7 +98,19 @@ pub const SuperBlockHeader = extern struct {
     /// as corruption (the boot-read law: refuse loud, never heal).
     state_string: [SuperBlockHeader.state_string_len]u8 = @splat(0),
 
-    reserved: [1940 - SuperBlockHeader.state_string_len]u8 = @splat(0),
+    /// The lifecycle marker's native node identity, stamped by the marker
+    /// store (`marker.zig`): the pair `{systemIdentifier, crashCounter}`
+    /// as explicit u16 halves, one-indexed, zero never a legal read — an
+    /// uninitialised or corrupt marker cannot be read as an identity. The
+    /// packed u32 (MSB system, LSB crash) is the wire form hosts derive
+    /// from it; the halves themselves are what a hexdump reads on disk.
+    /// Both fields are inside the header checksum (tamper-evident as a
+    /// whole) and the store refuses a checksum-valid copy reading zero
+    /// halves. Non-marker superblocks carry zeroes.
+    system_identifier: u16 = 0,
+    crash_counter: u16 = 0,
+
+    reserved: [1940 - SuperBlockHeader.state_string_len - 4]u8 = @splat(0),
 
     /// View/JV header suffix. Headers are ordered from high-to-low op.
     /// Unoccupied headers (after view_headers_count) are zeroed.
