@@ -1,8 +1,8 @@
 //! The lifecycle marker surface over the vendored superblock copies.
 //!
 //! Raw surface; the lifecycle routing lives in the adapter. The marker is
-//! the uVRR termination obligations' lifecycle marker
-//! (`docs/uvrr-termination-obligations-v0.6.1.md` §2-§4), stored by the
+//! the uVRR I/O obligations' termination chapter's lifecycle marker
+//! (docs/uvrr-io-obligations.md §2-§4 of the termination chapter), stored by the
 //! Zig store's quorum-of-copies construction (`zig/src/marker.zig`): four
 //! fixed sector-aligned Aegis-checksummed copies, hash-chained
 //! sequence/parent, quorum write verified at the `.verify` threshold (3/4)

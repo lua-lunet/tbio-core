@@ -312,8 +312,8 @@ export fn lunet_aof_iter_close(it: *AofIter) void {
 // ---------------------------------------------------------------------------
 // The lifecycle marker surface (the superblock copies' quorum construction).
 //
-// The marker is the uVRR termination obligations' lifecycle marker
-// (`docs/uvrr-termination-obligations-v0.6.1.md` §2-§4): `unflushed` (the
+// The marker is the uVRR I/O obligations' termination chapter's lifecycle
+// marker (docs/uvrr-io-obligations.md §2-§4): `unflushed` (the
 // running sentinel) → `stopped` (termination begins; the wire closed
 // before this write) → `flushed` (the durable-state write completed at the
 // drain point). The storage is the vendored superblock copies

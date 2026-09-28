@@ -81,9 +81,10 @@ Deliberately NOT vendored (the dependency web the strip cuts):
   quorum write with forced I/O verified at the `.verify` threshold, and
   the boot classification resolved through the vendored
   `superblock_quorums.zig` flexible quorums (highest sequence within the
-  `.open` threshold). The marker rides two `VSRState` fields the AOF-only
-  build never drives: `commit_max` = the incarnation (monotonic), 
-  `sync_view` = the lifecycle state. Both are inside the header checksum.
+  `.open` threshold). The marker's identity pair (the system identifier
+  and the crash counter) is explicit in the header; `commit_max` stays
+  zero and `sync_view` is the lifecycle state. All of it is inside the
+  header checksum.
 - `zig/build.zig` — the cdylib + static library + test steps and the
   `vsr_options` module.
 

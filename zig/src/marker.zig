@@ -10,8 +10,9 @@
 //! gate's provenance: uvrr-core v0.8.0, commit `be29396e`). Its storage is
 //! the vendored
 //! TigerBeetle superblock construction, applied the way the contract
-//! describes it (`docs/uvrr-termination-obligations-v0.6.1.md` §4, citing
-//! Lampson & Sturgis 1979 §5.1, "the good, the complete, or the newest"):
+//! describes it (docs/uvrr-io-obligations.md, the termination chapter §4,
+//! citing Lampson & Sturgis 1979 §5.1, "the good, the complete, or the
+//! newest"):
 //!
 //! - `constants.superblock_copies` (4) copies of a `SuperBlockHeader` in
 //!   fixed, sector-aligned zones of one marker file (`copy_size` apart),
