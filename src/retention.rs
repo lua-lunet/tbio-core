@@ -3,7 +3,7 @@
 //! directory and sweeps the pre-existing (full) files under the retention
 //! threshold.
 //!
-//! Policy (item21, as implemented):
+//! Policy, as implemented:
 //! 1. Keep the active file — never deleted.
 //! 2. Keep the newest full (pre-existing) file — the freshest restart
 //!    history always survives.

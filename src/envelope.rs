@@ -1,4 +1,4 @@
-//! The telemetry record envelope (item22 M1): the typed record layer above
+//! The telemetry record envelope: the typed record layer above
 //! the raw AOF append. Every AOF entry the telemetry system writes is one
 //! envelope record; the uVRR wire protocol itself is untouched — a Wire
 //! record's payload IS the raw wire message in its existing serialization,
