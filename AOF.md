@@ -115,8 +115,8 @@ logs once — telemetry never poisons the replication path.
 A reconfiguration that changes the learner's role is logged by the host's
 ordinary status/leader notes, not a correctness requirement — the AOF
 carries no role state. The writes ride the same epoch/config era context
-as the phi sketches: era transitions land in the stream as the Commits
-that fold them.
+as the rest of the telemetry: era transitions land in the stream as the
+Commits that fold them.
 
 ## Toolchain
 

@@ -46,7 +46,7 @@ fn marker_bytes_are_distinct() {
 }
 
 /// An unknown marker byte classifies to None — the reader's rejection path.
-/// Byte 5 is known: the interval-sample marker.
+/// Byte 5 is known: the reserved interval-sample marker.
 #[test]
 fn unknown_marker_byte_rejected() {
     assert_eq!(Marker::from_byte(0), None);
@@ -77,7 +77,7 @@ fn wire_record_carries_raw_bytes() {
 /// A telemetry record decodes to its JSON payload.
 #[test]
 fn telemetry_record_decodes_to_json() {
-    let json = br#"{"phi":1.5,"now_ms":1000,"prev_wait_ms":900,"next_wait_ms":1200}"#;
+    let json = br#"{"leader":33,"era":4,"view":1,"prev_wait_ms":900,"next_wait_ms":1200}"#;
     let record = Record::telemetry(Marker::TelemetryTimeoutDecision, 42, json);
     let encoded = record.encode();
     assert_eq!(encoded[0], Marker::TelemetryTimeoutDecision as u8);
@@ -87,15 +87,15 @@ fn telemetry_record_decodes_to_json() {
     assert_eq!(decoded.ns, 42);
     assert_eq!(decoded.payload, json.to_vec());
     let value: serde_json::Value = serde_json::from_slice(&decoded.payload).expect("valid JSON");
-    assert_eq!(value["phi"], 1.5);
+    assert_eq!(value["next_wait_ms"], 1200);
 }
 
-/// The interval-sample subsystem (the sampled heartbeat arrival + the
-/// learned interval + when it was sampled): round-trips and decodes to
-/// its JSON.
+/// The reserved interval-sample byte is in the known set: it classifies,
+/// and whatever payload it carries round-trips verbatim. No producer
+/// writes the kind, so no payload shape is pinned.
 #[test]
-fn interval_sample_record_round_trips() {
-    let json = br#"{"node":88,"era":4,"leader":33,"addr":"127.0.0.1:41101","dt_ms":22,"ts_ms":1789214915000}"#;
+fn reserved_interval_sample_record_round_trips() {
+    let json = br#"{"reserved":true}"#;
     let record = Record::telemetry(Marker::TelemetryIntervalSample, 77, json);
     let encoded = record.encode();
     assert_eq!(encoded[0], Marker::TelemetryIntervalSample as u8);

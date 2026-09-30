@@ -20,9 +20,10 @@
 //! | byte | marker                    | payload                                        |
 //! |------|---------------------------|------------------------------------------------|
 //! | 1    | `Wire`                    | a raw uVRR wire message (its own serialization, reused as-is) |
-//! | 2    | `TelemetryTimeoutDecision`| JSON: phi estimate, now, previous wait, next wait |
+//! | 2    | `TelemetryTimeoutDecision`| JSON: the re-armed election wait — leader, era, view, the previous wait, the next wait, the wait's bounds |
 //! | 3    | `TelemetryStateTransition`| JSON: the node's state transition               |
 //! | 4    | `TelemetryOutbound`       | JSON: one outbound message the node decided to send |
+//! | 5    | `TelemetryIntervalSample`| RESERVED: no producer in this release          |
 //!
 //! Any other marker byte is rejected on decode — a reader classifies each
 //! record and either hands the raw wire bytes back or the decoded telemetry
@@ -36,15 +37,15 @@ pub const HEADER_BYTES: usize = 1 + 8;
 pub enum Marker {
     /// The payload is a raw uVRR wire message in its existing serialization.
     Wire = 1,
-    /// The payload is the phi-informed timeout decision's JSON.
+    /// The payload is the re-armed election wait's JSON.
     TelemetryTimeoutDecision = 2,
     /// The payload is a state transition's JSON.
     TelemetryStateTransition = 3,
     /// The payload is one outbound message's JSON.
     TelemetryOutbound = 4,
-    /// The payload is one sampled heartbeat arrival's JSON: the monitor's
-    /// node id, era, leader, address, the learned inter-arrival `dt_ms`,
-    /// and the sample's `ts_ms` — the estimate-and-when evidence.
+    /// RESERVED: no producer writes this kind. Its byte is in the known
+    /// set, so the reader classifies it rather than rejecting it, and
+    /// the kind defines no payload shape.
     TelemetryIntervalSample = 5,
 }
 
