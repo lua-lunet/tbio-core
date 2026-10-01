@@ -23,7 +23,6 @@
 //! | 2    | `TelemetryTimeoutDecision`| JSON: the re-armed election wait — leader, era, view, the previous wait, the next wait, the wait's bounds |
 //! | 3    | `TelemetryStateTransition`| JSON: the node's state transition               |
 //! | 4    | `TelemetryOutbound`       | JSON: one outbound message the node decided to send |
-//! | 5    | `TelemetryIntervalSample`| RESERVED: no producer in this release          |
 //!
 //! Any other marker byte is rejected on decode — a reader classifies each
 //! record and either hands the raw wire bytes back or the decoded telemetry
@@ -43,10 +42,6 @@ pub enum Marker {
     TelemetryStateTransition = 3,
     /// The payload is one outbound message's JSON.
     TelemetryOutbound = 4,
-    /// RESERVED: no producer writes this kind. Its byte is in the known
-    /// set, so the reader classifies it rather than rejecting it, and
-    /// the kind defines no payload shape.
-    TelemetryIntervalSample = 5,
 }
 
 impl Marker {
@@ -58,7 +53,6 @@ impl Marker {
             2 => Some(Marker::TelemetryTimeoutDecision),
             3 => Some(Marker::TelemetryStateTransition),
             4 => Some(Marker::TelemetryOutbound),
-            5 => Some(Marker::TelemetryIntervalSample),
             _ => None,
         }
     }

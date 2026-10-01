@@ -46,11 +46,9 @@ fn marker_bytes_are_distinct() {
 }
 
 /// An unknown marker byte classifies to None — the reader's rejection path.
-/// Byte 5 is known: the reserved interval-sample marker.
 #[test]
 fn unknown_marker_byte_rejected() {
     assert_eq!(Marker::from_byte(0), None);
-    assert_eq!(Marker::from_byte(5), Some(Marker::TelemetryIntervalSample));
     assert_eq!(Marker::from_byte(0xFF), None);
     assert_eq!(Marker::from_byte(6), None);
 }
@@ -88,21 +86,6 @@ fn telemetry_record_decodes_to_json() {
     assert_eq!(decoded.payload, json.to_vec());
     let value: serde_json::Value = serde_json::from_slice(&decoded.payload).expect("valid JSON");
     assert_eq!(value["next_wait_ms"], 1200);
-}
-
-/// The reserved interval-sample byte is in the known set: it classifies,
-/// and whatever payload it carries round-trips verbatim. No producer
-/// writes the kind, so no payload shape is pinned.
-#[test]
-fn reserved_interval_sample_record_round_trips() {
-    let json = br#"{"reserved":true}"#;
-    let record = Record::telemetry(Marker::TelemetryIntervalSample, 77, json);
-    let encoded = record.encode();
-    assert_eq!(encoded[0], Marker::TelemetryIntervalSample as u8);
-    let decoded = Record::decode(&encoded).expect("decodes");
-    assert_eq!(decoded.marker, Marker::TelemetryIntervalSample);
-    assert_eq!(decoded.ns, 77);
-    assert_eq!(decoded.payload, json.to_vec());
 }
 
 /// A truncated buffer (shorter than the header) is rejected, not panicked.
