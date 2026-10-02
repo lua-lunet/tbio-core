@@ -37,6 +37,30 @@ const MessagePool = vsr.MessagePool;
 
 const log = std.log.scoped(.aof_c);
 
+/// The fine-grain log gate's build option (see build.zig's `-Dfine-logs`):
+/// closed by default — the suite's stdout stays quiet unless asked.
+const gate = @import("gate_options");
+
+/// The module root's half of the fine-grain log gate: std.log's level is
+/// pinned at `warn` unless the fine-logs option opens it, so every
+/// `debug`- and `info`-level site in this module (the vendored AOF's
+/// per-append chain detail, the vendored multiversion and superblock
+/// machinery's chatter) compiles to nothing — std.log's level check is
+/// comptime, so neither the line nor its formatting exists in a closed
+/// build. Without the pin a Debug-mode cdylib (the build the Rust suite
+/// links) defaults to `debug` and prints every one of them, raw, to
+/// stderr. The marker store's warn-level refusals (the boot-read law's
+/// loud logs) pass the pin and stay loud in every mode.
+///
+/// (A test build ignores this declaration — the compiler's test runner
+/// owns std.log's options there — which is why the vendored quorum file
+/// carries its own gate for the warn-level detail the runner would
+/// print. The enforcing census test at the bottom of this file asserts
+/// both gates exist.)
+pub const std_options: std.Options = .{
+    .log_level = if (gate.fine_logs) .debug else .warn,
+};
+
 /// One open AOF file plus the C ABI's own header-builder state: the entry
 /// chain (each record's Prepare header names the previous entry's checksum
 /// as its parent), the op counter, and the force knob. The message pool
@@ -520,4 +544,200 @@ export fn lunet_aof_marker_format(
     defer store.close(std.heap.c_allocator);
     store.format(system, crash, marker_state) catch |err| return marker_error(err);
     return OK;
+}
+
+// -------------------------------------------------------------------
+// The fine-grain log census.
+//
+// The suite's finest-grain trace detail — the per-copy and per-quorum
+// checksum lines the vendored quorum machinery logs, and every log line
+// below `warn` — never prints unless a build asks for it. Two gates hold
+// that law and both are asserted here, the same shape as the host
+// adapter's lifecycle-path census (`every path through boot and stop
+// names itself`): the gates must exist, and the census of fine-grain
+// sites the sources carry must equal the census declared here. A new
+// fine-grain site outside the gated paths fails this test naming its
+// file; a declared count no source carries fails it too.
+//
+// - The module root pins std.log's level at `warn` unless the fine-logs
+//   gate opens: every `debug`- and `info`-level site in the module
+//   compiles to nothing (std.log's level check is comptime, so neither
+//   the line nor its formatting exists in a closed build). Without the
+//   pin, a Debug-mode cdylib — the build the Rust suite links — prints
+//   every one of them, raw, straight to stderr.
+// - The vendored `vsr/superblock_quorums.zig` carries its own comptime
+//   gate: its per-copy detail is trace, not operator output, and the
+//   test runner the `zig build test` step uses prints warn-level lines
+//   through the runner's own log fn (the module root's pin cannot
+//   reach it), so the file's warn sites are gated at their own edge.
+//
+// The marker store's warn lines are NOT fine grain: they are the
+// boot-read law's loud refusals (a bad checksum on any copy is a loud
+// log, and the non-unanimity at the moment of resolution is logged in
+// full) — the store's only voice, since the C ABI carries its refusals
+// as distinct codes the host adapter panics on.
+// -------------------------------------------------------------------
+
+/// One compiled source file of this module (the module rooted here),
+/// with its declared count of fine-grain log sites.
+const CensusFile = struct {
+    name: []const u8,
+    source: []const u8,
+    /// The `debug`- and `info`-level log call sites — the levels the
+    /// module root's pin discards at comptime.
+    below_warn: usize,
+    /// The `warn`-level sites of the one file whose warn detail is
+    /// fine grain (the vendored quorum file's per-copy lines); every
+    /// other file's warn lines are the loud operator law.
+    fine_warn: usize,
+};
+
+/// The census's ground truth: every source file of the module that can
+/// emit a log line (the vendored `stdx` extension module is a separate
+/// compilation whose sites are unreachable from this module's code).
+const census_files = [_]CensusFile{
+    .{ .name = "aof_c.zig", .source = @embedFile("aof_c.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "aof.zig", .source = @embedFile("aof.zig"), .below_warn = 5, .fine_warn = 0 },
+    .{ .name = "config.zig", .source = @embedFile("config.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "constants.zig", .source = @embedFile("constants.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "io.zig", .source = @embedFile("io.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "io/common.zig", .source = @embedFile("io/common.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "lsm/schema.zig", .source = @embedFile("lsm/schema.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "marker.zig", .source = @embedFile("marker.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "message_pool.zig", .source = @embedFile("message_pool.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "multiversion.zig", .source = @embedFile("multiversion.zig"), .below_warn = 7, .fine_warn = 0 },
+    .{ .name = "stack.zig", .source = @embedFile("stack.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "tigerbeetle.zig", .source = @embedFile("tigerbeetle.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "vsr.zig", .source = @embedFile("vsr.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "vsr/checksum.zig", .source = @embedFile("vsr/checksum.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "vsr/message_header.zig", .source = @embedFile("vsr/message_header.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "vsr/superblock.zig", .source = @embedFile("vsr/superblock.zig"), .below_warn = 8, .fine_warn = 0 },
+    .{ .name = "vsr/superblock_quorums.zig", .source = @embedFile("vsr/superblock_quorums.zig"), .below_warn = 2, .fine_warn = 5 },
+};
+
+/// The vendored quorum file: the one source whose warn-level detail is
+/// fine grain (every copy of every quorum read, logged).
+const census_quorum_file = "vsr/superblock_quorums.zig";
+
+/// The crate-owned files (not vendored): a raw print in our own code is
+/// a fine-grain site outside every gate.
+const census_owned = [_][]const u8{ "aof_c.zig", "marker.zig", "io.zig" };
+
+/// One failed census assertion: logged at warn (the runner prints warn
+/// lines, and a Debug-mode cdylib pins its level at warn too), then
+/// returned as the test's error.
+fn census_fail(comptime format: []const u8, args: anytype) anyerror!void {
+    std.log.scoped(.census).warn(format, args);
+    return error.TestFineGrainLogCensus;
+}
+
+fn census_count(source: []const u8, needle: []const u8) usize {
+    var total: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, needle)) |found| {
+        total += 1;
+        cursor = found + needle.len;
+    }
+    return total;
+}
+
+// The ask-in: `-Dfine-logs=true` re-opens the fine grain for a test run.
+// The compiler's test runner owns std.log's options in a test build and
+// filters at its own `std.testing.log_level` (warn by default), so the
+// runner's filter rises here — the root file's tests are collected and
+// run first, before any other file's tests log.
+test {
+    if (gate.fine_logs) std.testing.log_level = .debug;
+}
+
+test "the fine-grain log census: every site behind a gate, every gate declared" {
+    // The needles are assembled at run time so this scanner's own
+    // source carries no literal site for any of them to count.
+    const debug_site = "log.de" ++ "bug(";
+    const info_site = "log.in" ++ "fo(";
+    const warn_site = "log.wa" ++ "rn(";
+    const raw_print = "std.debug.pr" ++ "int(";
+    const raw_stdout = "getStd" ++ "Out(";
+    const raw_stderr = "getStd" ++ "Err(";
+    const root_gate = "std_opt" ++ "ions: std.Options";
+    const root_pin = ".log_level = if (gate.fine_logs) .debug e" ++ "lse .warn";
+    const quorum_gate = "const log = if (gate.fine_" ++ "logs) std.log.scoped(.superblock_quorums) else quiet_log;";
+
+    // The census: every fine-grain site is declared, two ways — a site
+    // the sources carry that the census does not declare is a print
+    // nobody gated; a declared count no source carries is a census
+    // gone stale.
+    for (census_files) |entry| {
+        const below = census_count(entry.source, debug_site) +
+            census_count(entry.source, info_site);
+        if (below != entry.below_warn) {
+            return census_fail(
+                "fine-grain census: {s} carries {d} below-warn sites, the census declares {d} — declare or delete them",
+                .{ entry.name, below, entry.below_warn },
+            );
+        }
+        if (std.mem.eql(u8, entry.name, census_quorum_file)) {
+            const warns = census_count(entry.source, warn_site);
+            if (warns != entry.fine_warn) {
+                return census_fail(
+                    "fine-grain census: {s} carries {d} fine-warn sites, the census declares {d} — declare or delete them",
+                    .{ entry.name, warns, entry.fine_warn },
+                );
+            }
+        }
+        // A raw debug print anywhere in the module bypasses every gate.
+        if (census_count(entry.source, raw_print) != 0) {
+            return census_fail(
+                "fine-grain census: {s} carries a raw debug print outside every gate",
+                .{entry.name},
+            );
+        }
+    }
+    for (census_owned) |name| {
+        for (census_files) |entry| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            if (census_count(entry.source, raw_stdout) != 0 or
+                census_count(entry.source, raw_stderr) != 0)
+            {
+                return census_fail(
+                    "fine-grain census: {s} (crate-owned) writes to a raw stream outside every gate",
+                    .{name},
+                );
+            }
+        }
+    }
+
+    // The module root's level pin: without it a Debug-mode cdylib (the
+    // build the Rust suite links) prints every below-warn site, raw, to
+    // stderr. Name every ungated site on the way out.
+    const root = census_files[0].source;
+    var gates_missing = false;
+    if (std.mem.indexOf(u8, root, root_gate) == null or
+        std.mem.indexOf(u8, root, root_pin) == null)
+    {
+        gates_missing = true;
+        for (census_files) |entry| {
+            if (entry.below_warn != 0) {
+                std.log.scoped(.census).warn(
+                    "fine-grain census: the module root pins no std.log level — {s} carries {d} below-warn sites that print raw in every Debug-mode build",
+                    .{ entry.name, entry.below_warn },
+                );
+            }
+        }
+    }
+
+    // The vendored quorum file's own gate: its per-copy detail is trace,
+    // and the test run prints warn lines through the runner's log fn —
+    // only the file's comptime gate reaches them.
+    for (census_files) |entry| {
+        if (!std.mem.eql(u8, entry.name, census_quorum_file)) continue;
+        if (std.mem.indexOf(u8, entry.source, quorum_gate) == null) {
+            gates_missing = true;
+            std.log.scoped(.census).warn(
+                "fine-grain census: {s} gates no fine-grain log — its {d} warn and {d} below-warn sites (the per-copy checksum detail) print in every test run",
+                .{ entry.name, entry.fine_warn, entry.below_warn },
+            );
+        }
+    }
+    if (gates_missing) return error.TestFineGrainLogCensus;
 }

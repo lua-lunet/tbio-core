@@ -15,7 +15,7 @@ source changes. This supplements, and does not replace, the upstream release
 tag and the eventual fork commit/tag that will own this adapted source tree.
 
 Current source SHA-256:
-`3d6765fe630a3ae163e2ac169006fe5c10978f058418300a89b4d3362ee8a97a`.
+`84abbd8718ffa849b792fb319dc0cd1cb972e091494d387bb85de80d5e2ee5a3`.
 
 Licence: **Apache-2.0** (`LICENSE-TigerBeetle`, copied from the pinned
 ref). See `README.md` and `AOF.md` for the licence facts and the one
@@ -44,7 +44,7 @@ byte-identical: files written by this build parse with upstream's
 | `src/vsr/message_header.zig` | `zig/src/vsr/message_header.zig` | Verbatim. |
 | `src/vsr/checksum.zig` | `zig/src/vsr/checksum.zig` | Verbatim (Aegis-based checksums — the on-disk contract). |
 | `src/vsr/superblock.zig` | `zig/src/vsr/superblock.zig` | Verbatim except: the two `Storage == testing/storage` conditional blocks inside the (lazy) SuperBlock state machine are removed — the vendored build carries no testing corpus. Only `SuperBlockHeader`/`CheckpointState` (the on-wire layout constants and `view_headers_max` sizing assert) are in the compiled closure. |
-| `src/vsr/superblock_quorums.zig` | `zig/src/vsr/superblock_quorums.zig` | Verbatim (lazy — referenced only through superblock.zig's `Quorums`). |
+| `src/vsr/superblock_quorums.zig` | `zig/src/vsr/superblock_quorums.zig` | Verbatim except: the module-level `log` binding is gated behind the fine-logs build option (the per-copy and per-quorum checksum lines are finest-grain trace, quiet unless `-Dfine-logs` asks; see the file's gate comment and the enforcing census test in `zig/src/aof_c.zig`). |
 | `src/constants.zig` | `zig/src/constants.zig` | Verbatim. |
 | `src/config.zig` | `zig/src/config.zig` | Verbatim (build-time `vsr_options` provided by this crate's `build.zig`, same fields upstream's `build_vsr_module` sets; values = upstream defaults). |
 | `src/multiversion.zig` | `zig/src/multiversion.zig` | Stripped to the identity types `Release`/`ReleaseTriple`/`ReleaseList` (+ the `ReleaseTriple.parse` test): the `MultiversionOS` re-exec machinery imports the async IO backends and is not referenced by the AOF path. |
@@ -85,8 +85,11 @@ Deliberately NOT vendored (the dependency web the strip cuts):
   and the crash counter) is explicit in the header; `commit_max` stays
   zero and `sync_view` is the lifecycle state. All of it is inside the
   header checksum.
-- `zig/build.zig` — the cdylib + static library + test steps and the
-  `vsr_options` module.
+- `zig/build.zig` — the cdylib + static library + test steps, the
+  `vsr_options` module, and the fine-grain log gate (`-Dfine-logs`): the
+  `gate_options` module the module root's std.log level pin
+  (`zig/src/aof_c.zig`) and the vendored quorum file's comptime gate
+  consume.
 
 ## Provenance evidence
 

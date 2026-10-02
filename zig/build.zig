@@ -11,6 +11,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The fine-grain log gate (`-Dfine-logs`): the suite's finest-grain
+    // trace detail — the vendored quorum machinery's per-copy checksum
+    // lines, and every log line below `warn` — is quiet unless a build
+    // asks for it. See src/aof_c.zig (the module root's level pin and
+    // the enforcing census test) and src/vsr/superblock_quorums.zig.
+    const fine_logs = b.option(bool, "fine-logs", "Emit the finest-grain trace detail (quiet unless asked)") orelse false;
+
     const vsr_options = b.addOptions();
     // The AOF writes no cluster identity of its own; the release stamp keeps
     // the config.zig plumbing identical to upstream's default production
@@ -19,6 +26,13 @@ pub fn build(b: *std.Build) void {
     vsr_options.addOption(bool, "config_verify", true);
     vsr_options.addOption([]const u8, "release", "65535.0.0");
     vsr_options.addOption([]const u8, "release_client_min", "65535.0.0");
+
+    // The gate's own options module, separate from `vsr_options` (which
+    // mirrors upstream's options module exactly): one bool, consumed by
+    // the module root's std.log level pin and the vendored quorum file's
+    // comptime gate.
+    const gate_options = b.addOptions();
+    gate_options.addOption(bool, "fine_logs", fine_logs);
 
     const stdx_module = b.addModule("stdx", .{
         .root_source_file = b.path("src/stdx/stdx.zig"),
@@ -31,6 +45,7 @@ pub fn build(b: *std.Build) void {
     });
     srcs_module.addImport("stdx", stdx_module);
     srcs_module.addOptions("vsr_options", vsr_options);
+    srcs_module.addOptions("gate_options", gate_options);
     srcs_module.link_libc = true;
 
     const cdylib = b.addSharedLibrary(.{

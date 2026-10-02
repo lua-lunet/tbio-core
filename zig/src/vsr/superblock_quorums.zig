@@ -1,6 +1,36 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const log = std.log.scoped(.superblock_quorums);
+
+// The lunet fine-grain log gate (this file's one deviation from the
+// vendored 0.17.9 source; see VENDORED.md): the per-copy and per-quorum
+// checksum detail this file logs is finest-grain trace, never operator
+// output. Upstream logs every copy of every quorum read, flooding a
+// normal test run (the test runner prints warn-level lines through its
+// own log fn) and every Debug-mode embedder build (the cdylib the Rust
+// suite links). The gate keeps upstream's call sites verbatim; closed
+// (the default, `-Dfine-logs` unset) they compile to nothing — no
+// formatting, no writer — and a build that asks re-opens them.
+const gate = @import("gate_options");
+const log = if (gate.fine_logs) std.log.scoped(.superblock_quorums) else quiet_log;
+
+/// The closed half of the fine-grain log gate: every level discards. The
+/// file carries no err-level site, so the struct deliberately spells no
+/// err fn — an err line is a loud refusal, and adding one fails the
+/// closed build until the gate's class for it is decided consciously.
+const quiet_log = struct {
+    pub fn warn(comptime format: []const u8, args: anytype) void {
+        _ = format;
+        _ = args;
+    }
+    pub fn info(comptime format: []const u8, args: anytype) void {
+        _ = format;
+        _ = args;
+    }
+    pub fn debug(comptime format: []const u8, args: anytype) void {
+        _ = format;
+        _ = args;
+    }
+};
 
 const stdx = @import("stdx");
 const maybe = stdx.maybe;
