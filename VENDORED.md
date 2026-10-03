@@ -9,13 +9,13 @@ mise setup (`mise.toml: zig = "0.14.1"`), resolved by the wrapper's
 `build.rs` (`mise which zig` → `LUNET_LOCKS_AOF_ZIG` override → PATH).
 
 The current stripped source identity is reproducible with
-`tools/aof_source_hash.sh`: it hashes the sorted `(path, file SHA-256)` list
+`tools/source_hash.sh`: it hashes the sorted `(path, file SHA-256)` list
 under `zig/src`. The resulting hash is recorded here whenever the vendored
 source changes. This supplements, and does not replace, the upstream release
 tag and the eventual fork commit/tag that will own this adapted source tree.
 
 Current source SHA-256:
-`84abbd8718ffa849b792fb319dc0cd1cb972e091494d387bb85de80d5e2ee5a3`.
+`ba8e881fe3342d773eed10aefbc4a81462e97e95c8329d60d7e9026907d507ba`.
 
 Licence: **Apache-2.0** (`LICENSE-TigerBeetle`, copied from the pinned
 ref). See `README.md` and `AOF.md` for the licence facts and the one
@@ -39,7 +39,7 @@ byte-identical: files written by this build parse with upstream's
 
 | Upstream (0.17.9) | Vendored | Strip |
 |---|---|---|
-| `src/aof.zig` | `zig/src/aof.zig` | Keep `AOFEntry`, `AOFType(IO)` (init/close/write/sync/checkpoint/on_fsync/validate/Iterator), the `aof write / read` test. Drop the offline CLI (`main`, `CLIArgs`, `aof recover/debug/merge`) and `ReplayClient` — the recovery tooling rides the whole client/message-bus stack and is not the AOF write path. |
+| `src/aof.zig` | `zig/src/aof.zig` | Keep `AOFEntry`, `AOFType(IO)` (init/close/write/sync/checkpoint/on_fsync/validate/Iterator), the `aof write / read` test. The offline CLI (`main`, `CLIArgs`, `aof recover/debug/merge`), the `merge` function it drives and `ReplayClient` are not vendored — the recovery tooling rides the whole client/message-bus stack and is not the AOF write path. |
 | `src/vsr.zig` | `zig/src/vsr.zig` | Stripped root module: keep `Version`, `Command`, `Operation`, `Peer`, `BlockReference`, `Checkpoint`, `RegisterRequest/Result`, `BlockRequest`, `UpgradeRequest`, `ReconfigurationRequest/Result` + member helpers, and re-exports (Header, checksum, Release, MessagePool, tigerbeetle, CheckpointState). Drop every replica/client/message-bus/grid/storage/sync/testing re-export — none is referenced by the AOF path. Re-added verbatim from upstream for the marker surface's closure: `member_index`, `Zone` (the vendored superblock's `data_file_size_min` computes the grid padding through it), and `ClientSessions.encode_size` (the superblock's consistency asserts compare against it). |
 | `src/vsr/message_header.zig` | `zig/src/vsr/message_header.zig` | Verbatim. |
 | `src/vsr/checksum.zig` | `zig/src/vsr/checksum.zig` | Verbatim (Aegis-based checksums — the on-disk contract). |
@@ -47,7 +47,7 @@ byte-identical: files written by this build parse with upstream's
 | `src/vsr/superblock_quorums.zig` | `zig/src/vsr/superblock_quorums.zig` | Verbatim except: the module-level `log` binding is gated behind the fine-logs build option (the per-copy and per-quorum checksum lines are finest-grain trace, quiet unless `-Dfine-logs` asks; see the file's gate comment and the enforcing census test in `zig/src/aof_c.zig`). |
 | `src/constants.zig` | `zig/src/constants.zig` | Verbatim. |
 | `src/config.zig` | `zig/src/config.zig` | Verbatim (build-time `vsr_options` provided by this crate's `build.zig`, same fields upstream's `build_vsr_module` sets; values = upstream defaults). |
-| `src/multiversion.zig` | `zig/src/multiversion.zig` | Stripped to the identity types `Release`/`ReleaseTriple`/`ReleaseList` (+ the `ReleaseTriple.parse` test): the `MultiversionOS` re-exec machinery imports the async IO backends and is not referenced by the AOF path. |
+| `src/multiversion.zig` | `zig/src/multiversion.zig` | Stripped to the identity types `Release`/`ReleaseTriple` (+ the `ReleaseTriple.parse` test). The `MultiversionOS` re-exec machinery is not vendored — the `Multiversion` vtable, `ReleaseList`, `section_to_macho_cpu`, `MultiversionHeader`, the bundled-binary header/body parsers (`parse_elf`/`parse_macho`/`parse_pe`), and the process-replacement plumbing (`self_exe_path`, `random_wstr`, `wait_for_parent_to_exit`, `execveat`, `open_memory_file`) all exist to re-execute the replica binary at another release, and no AOF code path names any of them. |
 | `src/message_pool.zig` | `zig/src/message_pool.zig` | Verbatim (the message the C-ABI append path builds). |
 | `src/stack.zig` | `zig/src/stack.zig` | Verbatim (the pool's freelist). |
 | `src/tigerbeetle.zig` | `zig/src/tigerbeetle.zig` | Verbatim (`Operation`, the Account/Transfer schema — referenced by config.zig's cache-size defaults). |

@@ -605,7 +605,7 @@ const census_files = [_]CensusFile{
     .{ .name = "lsm/schema.zig", .source = @embedFile("lsm/schema.zig"), .below_warn = 0, .fine_warn = 0 },
     .{ .name = "marker.zig", .source = @embedFile("marker.zig"), .below_warn = 0, .fine_warn = 0 },
     .{ .name = "message_pool.zig", .source = @embedFile("message_pool.zig"), .below_warn = 0, .fine_warn = 0 },
-    .{ .name = "multiversion.zig", .source = @embedFile("multiversion.zig"), .below_warn = 7, .fine_warn = 0 },
+    .{ .name = "multiversion.zig", .source = @embedFile("multiversion.zig"), .below_warn = 0, .fine_warn = 0 },
     .{ .name = "stack.zig", .source = @embedFile("stack.zig"), .below_warn = 0, .fine_warn = 0 },
     .{ .name = "tigerbeetle.zig", .source = @embedFile("tigerbeetle.zig"), .below_warn = 0, .fine_warn = 0 },
     .{ .name = "vsr.zig", .source = @embedFile("vsr.zig"), .below_warn = 0, .fine_warn = 0 },
