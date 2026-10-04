@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     srcs_module.link_libc = true;
 
     const cdylib = b.addSharedLibrary(.{
-        .name = "lunet_locks_aof",
+        .name = "tbio",
         .root_module = srcs_module,
         .version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 },
     });
@@ -68,7 +68,7 @@ pub fn build(b: *std.Build) void {
     // artifacts carry the same exports; the Rust build script picks the
     // link mode.
     const static_lib = b.addStaticLibrary(.{
-        .name = "lunet_locks_aof",
+        .name = "tbio",
         .root_module = srcs_module,
     });
     static_lib.bundle_compiler_rt = true;

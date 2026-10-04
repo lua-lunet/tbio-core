@@ -6,7 +6,7 @@ release tag **0.17.9** (published 2026-07-06), vendored from the pinned ref
 Toolchain: Zig **0.14.1** — upstream's own pinned version (upstream
 `zig/download.sh` pins 0.14.1 for this release); wired through this repo's
 mise setup (`mise.toml: zig = "0.14.1"`), resolved by the wrapper's
-`build.rs` (`mise which zig` → `LUNET_LOCKS_AOF_ZIG` override → PATH).
+`build.rs` (`mise which zig` → `TBIO_ZIG` override → PATH).
 
 The current stripped source identity is reproducible with
 `tools/source_hash.sh`: it hashes the sorted `(path, file SHA-256)` list

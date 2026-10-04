@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lunet_locks_aof::marker::{self, MarkerState, NodeIdentity};
+use tbio::marker::{self, MarkerState, NodeIdentity};
 
 fn workdir(name: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -18,7 +18,7 @@ fn workdir(name: &str) -> PathBuf {
         .expect("clock is after Unix epoch")
         .as_nanos();
     let dir = std::env::temp_dir().join(format!(
-        "lunet-locks-aof-marker-{name}-{}-{unique}",
+        "tbio-core-marker-{name}-{}-{unique}",
         std::process::id()
     ));
     fs::create_dir_all(&dir).expect("marker workdir");

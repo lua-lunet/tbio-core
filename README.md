@@ -6,7 +6,7 @@ store** over the superblock quorum-of-copies construction, vendored from
 source tree (`zig/`), compiled with upstream's pinned Zig 0.14.1 to a C-ABI cdylib, behind a safe
 Rust wrapper.
 
-The repository is named `tbio-core`; the crate it builds is named `lunet-locks-aof`. System
+System
 description, the C ABI, the optional force knob, the retention policy, and the standby learner
 wiring live in [`AOF.md`](AOF.md); the upstream file map and every strip is recorded in
 [`VENDORED.md`](VENDORED.md).
@@ -53,7 +53,7 @@ with the optional force knob, the typed envelope record layer over the raw appen
   ([docs/uvrr-io-obligations.md](https://github.com/lua-lunet/uvrr-core/blob/main/docs/uvrr-io-obligations.md)).
 - **[lua-lunet/lunet-locks](https://github.com/lua-lunet/lunet-locks)**, two consumers with
   different halves:
-  - `ext/advisory_lock` takes **only the marker store** (`lunet_locks_aof::marker`) for its
+  - `ext/advisory_lock` takes **only the marker store** (`tbio::marker`) for its
     lifecycle and identity writes: the graceful-stop path drains its own event series, then writes
     the `stopped` and `flushed` marker rounds through this store, so a marker that says flushed
     vouches for the drained bytes under it. The `LKE1` record series in that crate's `aof.rs` and
@@ -84,7 +84,7 @@ cargo test --manifest-path ext/lunet-locks-aof/Cargo.toml
 ```
 
 `build.rs` compiles the Zig cdylib with the repo's mise-pinned Zig
-0.14.1 (`LUNET_LOCKS_AOF_ZIG` → `mise which zig` → PATH) and links the
+0.14.1 (`TBIO_ZIG` → `mise which zig` → PATH) and links the
 wrapper against it. The Zig side has its own suite:
 
 ```console

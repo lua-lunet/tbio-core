@@ -3,7 +3,7 @@
 //! boundary. The planner is pure; the on-disk integration (open sweeps the
 //! directory) is covered by the wrapper test.
 
-use lunet_locks_aof::retention::{
+use tbio::retention::{
     AofSeriesFile, DEFAULT_RETENTION_BYTES, MIN_RETAINED, epoch_file_name, list_aof_files,
     parse_aof_name, retention_plan,
 };
@@ -128,7 +128,7 @@ fn min_retained_is_two() {
 #[test]
 fn list_aof_files_lists_only_aof_series_sorted_oldest_first() {
     let dir = std::env::temp_dir().join(format!(
-        "lunet-locks-aof-list-{}",
+        "tbio-core-list-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

@@ -1,16 +1,16 @@
 [package]
-name = "lunet-locks-aof"
-version = "0.1.0"
+name = "tbio-core"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-links = "lunet_locks_aof"
+links = "tbio"
 build = "build.rs"
 
-description = "Safe Rust binding over the vendored TigerBeetle AOF (append-only write-behind log, Zig C ABI)"
+description = "Safe Rust binding over the vendored TigerBeetle durable-IO strip: the AOF (append-only write-behind log) and the lifecycle marker store over the superblock quorum-of-copies construction, Zig C ABI"
 license = "Apache-2.0"
 
 [lib]
-name = "lunet_locks_aof"
+name = "tbio"
 crate-type = ["rlib"]
 
 [dependencies]

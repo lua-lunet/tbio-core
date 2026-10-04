@@ -3,11 +3,11 @@
 //! Plus the wrapper surface tests (open/append/flush/close and the
 //! optional force knob) and the on-disk retention sweep at open.
 
-use lunet_locks_aof::{AofFile, Options, retention};
+use tbio::{AofFile, Options, retention};
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "lunet-locks-aof-{name}-{}-{}",
+        "tbio-core-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -39,7 +39,7 @@ fn ffi_append_read_round_trips_through_the_cdylib() {
 
     let active = active_file(&dir).expect("active file exists");
     let mut it =
-        unsafe { lunet_locks_aof::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
+        unsafe { tbio::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
             .expect("iterator opens");
     let first = it.next_entry().unwrap().expect("first entry");
     assert_eq!(first.op, 1);
@@ -71,9 +71,9 @@ fn ffi_read_rejects_a_corrupted_entry_checksum() {
     std::fs::write(&active, &bytes).unwrap();
 
     let mut it =
-        unsafe { lunet_locks_aof::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
+        unsafe { tbio::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
             .expect("iterator opens");
-    assert_eq!(it.next_entry().unwrap_err(), lunet_locks_aof::ffi::SERVICE);
+    assert_eq!(it.next_entry().unwrap_err(), tbio::ffi::SERVICE);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -126,10 +126,10 @@ fn wrapper_open_creates_the_epoch_named_active_file() {
 fn wrapper_append_rejects_oversized_records() {
     let dir = temp_dir("oversize");
     let mut aof = AofFile::open(&dir).expect("open");
-    let oversized = vec![0u8; lunet_locks_aof::ffi::RECORD_MAX + 1];
+    let oversized = vec![0u8; tbio::ffi::RECORD_MAX + 1];
     assert!(matches!(
         aof.append(&oversized),
-        Err(lunet_locks_aof::Error::TooLarge)
+        Err(tbio::Error::TooLarge)
     ));
     aof.close().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
@@ -170,7 +170,7 @@ fn wrapper_force_flush_on_round_trips_per_entry() {
 
     let active = active_file(&dir).unwrap();
     let mut it =
-        unsafe { lunet_locks_aof::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
+        unsafe { tbio::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
             .expect("iterator opens");
     let entry = it.next_entry().unwrap().expect("entry");
     assert_eq!(entry.bytes, b"forced durability".to_vec());

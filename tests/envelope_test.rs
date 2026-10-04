@@ -2,7 +2,7 @@
 //! marker enum, the header codec, the typed reader's classification, and
 //! the unknown-marker rejection.
 
-use lunet_locks_aof::envelope::{self, Marker, Record};
+use tbio::envelope::{self, Marker, Record};
 
 /// The header is one marker byte plus eight local-clock nanoseconds.
 #[test]

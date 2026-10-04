@@ -3,7 +3,7 @@
 //! links the Rust wrapper against it.
 //!
 //! Zig resolution order:
-//! 1. `LUNET_LOCKS_AOF_ZIG` — an explicit zig binary path;
+//! 1. `TBIO_ZIG` — an explicit zig binary path;
 //! 2. `mise which zig` (the project's pinned toolchain, see mise.toml);
 //! 3. plain `zig` from PATH (a mise-activated shell provides it).
 //!
@@ -14,7 +14,7 @@ use std::process::Command;
 
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let lib_dir = if let Ok(path) = std::env::var("LUNET_LOCKS_AOF_LIB_DIR") {
+    let lib_dir = if let Ok(path) = std::env::var("TBIO_LIB_DIR") {
         // Container/release builds can consume the separately built,
         // architecture-specific AOF artifact.
         PathBuf::from(path)
@@ -26,7 +26,7 @@ fn main() {
         } else {
             "-Doptimize=Debug"
         };
-        let target = std::env::var("LUNET_LOCKS_AOF_TARGET").unwrap_or_else(|_| {
+        let target = std::env::var("TBIO_TARGET").unwrap_or_else(|_| {
             // An explicit triple, never "native": the native build
             // links the build runner against the host SDK, which
             // varies per CI image (the macOS runners link without
@@ -82,11 +82,11 @@ fn main() {
     // this shared library, so it opts in.
     let static_link = std::env::var("CARGO_FEATURE_STATIC").as_deref() == Ok("1");
     if static_link {
-        println!("cargo:rustc-link-lib=static=lunet_locks_aof");
+        println!("cargo:rustc-link-lib=static=tbio");
     } else {
-        println!("cargo:rustc-link-lib=dylib=lunet_locks_aof");
+        println!("cargo:rustc-link-lib=dylib=tbio");
 
-        // The cdylib's install name is `@rpath/liblunet_locks_aof.dylib` (zig's
+        // The cdylib's install name is `@rpath/libtbio.dylib` (zig's
         // default), so every runtime consumer — the wrapper's own tests, the
         // lease-sequencer binary — needs the rpath pointing at the artifact.
         // `rustc-link-arg-tests` requires a test target; the package's tests are
@@ -95,26 +95,26 @@ fn main() {
     }
 
     // Downstream binaries (e.g. the lease-sequencer example) read this
-    // metadata through the `links = "lunet_locks_aof"` contract as
-    // DEP_LUNET_LOCKS_AOF_LIB_DIR and emit their own runtime rpath.
+    // metadata through the `links = "tbio"` contract as
+    // DEP_TBIO_LIB_DIR and emit their own runtime rpath.
     println!("cargo:metadata=lib_dir={}", lib_dir.display());
 
     println!("cargo:rerun-if-changed=zig");
     // The target and toolchain overrides change the AOF's own output, so
     // they are build-script inputs, not incidental environment.
-    println!("cargo:rerun-if-env-changed=LUNET_LOCKS_AOF_TARGET");
-    println!("cargo:rerun-if-env-changed=LUNET_LOCKS_AOF_ZIG");
-    println!("cargo:rerun-if-env-changed=LUNET_LOCKS_AOF_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=TBIO_TARGET");
+    println!("cargo:rerun-if-env-changed=TBIO_ZIG");
+    println!("cargo:rerun-if-env-changed=TBIO_LIB_DIR");
 }
 
 /// Resolve the zig binary: explicit override, then the mise-pinned
 /// toolchain, then PATH.
 fn locate_zig() -> PathBuf {
-    if let Ok(path) = std::env::var("LUNET_LOCKS_AOF_ZIG") {
+    if let Ok(path) = std::env::var("TBIO_ZIG") {
         let path = PathBuf::from(path);
         assert!(
             path.exists(),
-            "LUNET_LOCKS_AOF_ZIG does not exist: {path:?}"
+            "TBIO_ZIG does not exist: {path:?}"
         );
         return path;
     }

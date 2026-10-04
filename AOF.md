@@ -22,7 +22,7 @@ parse with upstream's `aof debug` / `aof merge`, and the vendored
 
 ## The C ABI
 
-The cdylib (`liblunet_locks_aof.{dylib,so}`, built by
+The cdylib (`libtbio.{dylib,so}`, built by
 `ext/lunet-locks-aof/zig/build.zig` with the repo's mise-pinned Zig
 0.14.1) exports:
 
@@ -122,10 +122,10 @@ Commits that fold them.
 
 Zig is pinned at **0.14.1** in the repo's `mise.toml` (upstream's own pin
 for the 0.17.9 release). `cargo build` of this crate invokes the Zig
-build through `build.rs`: `LUNET_LOCKS_AOF_ZIG` override →
+build through `build.rs`: `TBIO_ZIG` override →
 `mise which zig` → PATH `zig`. The cdylib's install name is
-`@rpath/liblunet_locks_aof.dylib`; downstream binaries get the runtime
-rpath via the `links = "lunet_locks_aof"` metadata contract (see the
+`@rpath/libtbio.dylib`; downstream binaries get the runtime
+rpath via the `links = "tbio"` metadata contract (see the
 lease-sequencer's `build.rs`).
 
 ## The honest framing
