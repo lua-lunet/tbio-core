@@ -1,0 +1,20 @@
+# SCREAMING: DO NOT MOVE ANYTHING.
+#
+# This file is load-bearing for build speed on macOS. macOS XProtect scans
+# every freshly linked executable on first exec, one at a time, through
+# syspolicyd (the Developer Tools privilege exempts binaries whose parent
+# app chain is granted). Each scan costs 15-59 seconds per binary; a full
+# suite of fresh test binaries pays ~60:1 overhead-to-work — roughly twenty
+# minutes of scanning for under a minute of actual test execution.
+#
+# The exemption follows the toolchain's home only while that home never
+# moves. Changing this pin (a routine bump, a channel switch, a
+# `rustup update`) relocates every build binary and re-triggers the entire
+# scan tax for every binary, on every machine, for every developer. A
+# toolchain move is an operator ruling, never a routine bump.
+#
+# Pinned: 1.96.0-aarch64-apple-darwin, installed exactly at
+# ~/.rustup/toolchains/1.96.0-aarch64-apple-darwin. It does not move.
+
+[toolchain]
+channel = "1.96.0"
