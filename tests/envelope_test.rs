@@ -1,4 +1,4 @@
-//! The telemetry record envelope (item22 M1): red/green tests for the
+//! The telemetry record envelope: red/green tests for the
 //! marker enum, the header codec, the typed reader's classification, and
 //! the unknown-marker rejection.
 

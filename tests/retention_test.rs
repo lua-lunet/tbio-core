@@ -1,4 +1,4 @@
-//! Retention policy tests (item21, TDD): epoch filename, threshold
+//! Retention policy tests: epoch filename, threshold
 //! arithmetic, min-2 rule, delete-oldest-first order, and the threshold
 //! boundary. The planner is pure; the on-disk integration (open sweeps the
 //! directory) is covered by the wrapper test.
