@@ -80,4 +80,41 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the vendored AOF tests");
     test_step.dependOn(&run_tests.step);
+
+    // The Linux cross-compile check: the WAL C ABI and the io_uring +
+    // eventfd backend must compile for x86_64-linux even on a darwin dev
+    // host (the backend cannot execute here — CI/Linux exercises it).
+    // Build-only: compiles the same module root against a Linux target,
+    // so every comptime-gated branch (the uring backend, the linux ABI
+    // surface) is analyzed and type-checked.
+    const linux_module = b.createModule(.{
+        .root_source_file = b.path("src/aof_c.zig"),
+        .target = b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .musl,
+            // The vendored checksum (Aegis-128) asserts hardware AES +
+            // AVX. Zig's x86_64_v3/haswell models do not carry the
+            // aes/avx features explicitly; skylake is the floor model in
+            // zig's feature tables that does.
+            .cpu_model = .{ .explicit = &std.Target.x86.cpu.skylake },
+        }),
+        .optimize = optimize,
+    });
+    linux_module.addImport("stdx", stdx_module);
+    linux_module.addOptions("vsr_options", vsr_options);
+    linux_module.addOptions("gate_options", gate_options);
+    linux_module.link_libc = true;
+
+    const linux_check = b.addStaticLibrary(.{
+        .name = "lunet_locks_aof_linux_check",
+        .root_module = linux_module,
+    });
+    linux_check.bundle_compiler_rt = true;
+
+    const check_linux_step = b.step(
+        "check-linux",
+        "Cross-compile the module for x86_64-linux (the io_uring WAL backend)",
+    );
+    check_linux_step.dependOn(&linux_check.step);
 }
