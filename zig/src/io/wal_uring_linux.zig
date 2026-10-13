@@ -56,15 +56,6 @@ comptime {
     }
 }
 
-/// One queued/in-flight write's owned buffer. The ephemeral data-ring and
-/// header-ring records are 64/40 bytes, the durable frame write is 768
-/// bytes (the frame is the unit), the compaction runs are one contiguous
-/// buffer per ring, and the zero-tail chunks are 4 KiB — allocations are
-/// small and bounded by the ring geometry.
-const Op = struct {
-    buf: []u8,
-};
-
 /// The ring geometry for one engine capacity: worst case, one outstanding
 /// steady batch queues through a ring of `entries` SQ slots (drained
 /// eagerly at half full) — the ephemeral record's data + header writes and
@@ -104,9 +95,15 @@ pub const UringIO = struct {
     entries: u16,
     ops_len: u32,
 
-    /// The ops table and done bitmap: id % ops_len, sound because the
-    /// unreaped window stays below ops_len (see the geometry comment).
-    ops: []?Op,
+    /// The queued-write table and done bitmap: id % ops_len, sound
+    /// because the unreaped window stays below ops_len (see the geometry
+    /// comment). Each entry is the write's owned buffer (freed at reap);
+    /// the ephemeral data/header-ring records are 64/40 bytes, the
+    /// durable frame write is 768 bytes (the frame is the unit), the
+    /// compaction runs are one contiguous buffer per ring, and the
+    /// zero-tail chunks are 4 KiB — allocations are small and bounded by
+    /// the ring geometry.
+    ops: []?[]u8,
     done: []u64,
 
     /// Total operations queued since open — each op's id.
@@ -117,10 +114,6 @@ pub const UringIO = struct {
     /// CQEs that completed with a negative result (the write or fsync
     /// did not land). Never silent: the ABI poisons the handle.
     completion_errors: u64 = 0,
-    /// enter() failures (everything but EINTR). Never silent.
-    enter_errors: u64 = 0,
-    /// The negative errno of the latest failed completion.
-    last_errno: ?i32 = null,
     /// The fsync audit: blocking fsyncs completed through the ring.
     fsync_count: usize = 0,
 
@@ -172,7 +165,7 @@ pub const UringIO = struct {
 
         try ring.register_eventfd(event_fd);
 
-        const ops = try std.heap.c_allocator.alloc(?Op, geometry.ops_len);
+        const ops = try std.heap.c_allocator.alloc(?[]u8, geometry.ops_len);
         errdefer std.heap.c_allocator.free(ops);
         @memset(ops, null);
 
@@ -191,12 +184,15 @@ pub const UringIO = struct {
         };
     }
 
+    /// Tears the ring down and closes the file. A dirty close drops the
+    /// in-flight state by contract (the documented loss window); the
+    /// queued buffers are freed so nothing leaks.
     pub fn close(self: *UringIO) void {
         // A dirty close drops the in-flight state by contract (the
         // documented loss window); free the queued buffers so nothing
         // leaks, then tear the ring down.
-        for (self.ops) |maybe_op| {
-            if (maybe_op) |op| std.heap.c_allocator.free(op.buf);
+        for (self.ops) |maybe_buf| {
+            if (maybe_buf) |buf| std.heap.c_allocator.free(buf);
         }
         std.heap.c_allocator.free(self.ops);
         std.heap.c_allocator.free(self.done);
@@ -220,7 +216,7 @@ pub const UringIO = struct {
         };
         sqe.prep_write(self.fd, buf, offset);
         sqe.user_data = self.submitted;
-        self.ops[@intCast(self.submitted % self.ops_len)] = .{ .buf = buf };
+        self.ops[@intCast(self.submitted % self.ops_len)] = buf;
         self.submitted += 1;
     }
 
@@ -244,20 +240,16 @@ pub const UringIO = struct {
                 // A signal interrupted the enter; the SQEs are still
                 // queued — retry.
                 error.SignalInterrupt => continue,
-                else => {
-                    self.enter_errors += 1;
-                    return error.WalEnterFailed;
-                },
+                else => return error.WalEnterFailed,
             }
         }
-        self.enter_errors += 1;
         return error.WalEnterFailed;
     }
 
     /// Non-blocking completion reap: drains every CQE ready now, frees
     /// each op's buffer, advances the contiguous watermark. Returns the
     /// number of completions reaped. Failures are recorded on the
-    /// backend (`completion_errors`, `last_errno`), never silent.
+    /// backend (`completion_errors`), never silent.
     pub fn pump(self: *UringIO) usize {
         var cqes: [64]linux.io_uring_cqe = undefined;
         var total: usize = 0;
@@ -265,10 +257,7 @@ pub const UringIO = struct {
         while (attempts < 16) : (attempts += 1) {
             const n = self.ring.copy_cqes(&cqes, 0) catch |err| switch (err) {
                 error.SignalInterrupt => continue,
-                else => {
-                    self.enter_errors += 1;
-                    return total;
-                },
+                else => return total,
             };
             for (cqes[0..n]) |cqe| self.complete(cqe);
             total += n;
@@ -336,14 +325,13 @@ pub const UringIO = struct {
         const id = cqe.user_data;
         const slot: usize = @intCast(id % self.ops_len);
 
-        if (self.ops[slot]) |op| {
-            std.heap.c_allocator.free(op.buf);
+        if (self.ops[slot]) |buf| {
+            std.heap.c_allocator.free(buf);
             self.ops[slot] = null;
         }
 
         if (cqe.res < 0) {
             self.completion_errors += 1;
-            self.last_errno = cqe.res;
             if (id == self.fsync_id) self.fsync_res = cqe.res;
             log.warn("wal uring: op {d} completed with errno {d}", .{ id, cqe.res });
         }

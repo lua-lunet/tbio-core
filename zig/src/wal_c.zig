@@ -56,7 +56,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mem = std.mem;
 const assert = std.debug.assert;
-const stdx = @import("stdx");
 
 const wal_snapshot = @import("wal_snapshot.zig");
 
@@ -78,6 +77,7 @@ const Wal = wal_snapshot.WalType(BackendIO);
 /// the doc's table notes each counter's stream). Field order is the
 /// ABI's layout; the host mirrors it. One row per stream: the ephemeral
 /// stream's counters and the durable stream's, each completion-driven.
+/// The ABI's status row for one stream (the design doc's status table).
 pub const WalStreamStatus = extern struct {
     completed_generations: u64,
     completed_records: u64,
@@ -154,15 +154,11 @@ export fn wal_open(path: [*:0]const u8, capacity: u32) ?*WalHandle {
     return handle;
 }
 
-fn geometry_for(capacity: u32) uring_backend.Geometry {
-    return uring_backend.geometry_for_capacity(capacity);
-}
-
 /// Open the platform's backend: the ring geometry rides along only where
 /// there is a ring (the comptime-known branch prunes the other call).
 fn backend_open(path: []const u8, capacity: u32) !BackendIO {
     if (inline_completion) return BackendIO.open(path);
-    return BackendIO.open(path, geometry_for(capacity));
+    return BackendIO.open(path, uring_backend.geometry_for_capacity(capacity));
 }
 
 /// Close the handle. No fsync on the steady path: a dirty close drops
@@ -206,7 +202,7 @@ export fn wal_submit(handle: ?*WalHandle, buf: [*]const u8, len: usize) c_int {
         h.wal.submit(record, now) catch |err| switch (err) {
             error.WalCapacity => {
                 h.eph.refusals += 1;
-                return finish_batch(h, &h.eph, landed, now, -ENOSPC);
+                return close_generation(h, &h.eph, landed, now, -ENOSPC);
             },
             else => {
                 h.poisoned = true;
@@ -216,15 +212,7 @@ export fn wal_submit(handle: ?*WalHandle, buf: [*]const u8, len: usize) c_int {
         landed += 1;
     }
 
-    if (!inline_completion) {
-        h.wal.io.submit_batch() catch {
-            h.poisoned = true;
-            return -EIO;
-        };
-    }
-
-    h.wal.complete_generation();
-    return finish_batch(h, &h.eph, landed, now, 0);
+    return close_generation(h, &h.eph, landed, now, 0);
 }
 
 /// The steady tick's durable write: `frame_bytes` is the caller's
@@ -271,7 +259,7 @@ export fn wal_durable_submit(handle: ?*WalHandle, frame_bytes: [*]const u8, len:
         h.wal.submit_durable(change, now) catch |err| switch (err) {
             error.WalCapacity => {
                 h.dur.refusals += 1;
-                return finish_batch(h, &h.dur, landed, now, -ENOSPC);
+                return close_generation(h, &h.dur, landed, now, -ENOSPC);
             },
             else => {
                 h.poisoned = true;
@@ -281,15 +269,7 @@ export fn wal_durable_submit(handle: ?*WalHandle, frame_bytes: [*]const u8, len:
         landed += 1;
     }
 
-    if (!inline_completion) {
-        h.wal.io.submit_batch() catch {
-            h.poisoned = true;
-            return -EIO;
-        };
-    }
-
-    h.wal.complete_generation();
-    return finish_batch(h, &h.dur, landed, now, 0);
+    return close_generation(h, &h.dur, landed, now, 0);
 }
 
 /// Drain completions non-blocking. Inline-completion platforms: a no-op
@@ -470,11 +450,12 @@ fn durable_frames_agree(mirror: wal_snapshot.FatFrame, frame: wal_snapshot.FatFr
 
 /// The boot read: the engine's live set copied into `buf` as on-disk
 /// records (the submit path's own wire format — the host decodes what
-/// it needs). 0 = live set found and copied, 1 = none (cold start /
-/// content refusal: wrong checksums, twin disagreement, everything
-/// expired — all of those refuse at `wal_open` and never reach this),
-/// negative = an unexpected IO error. The host maps 0/1/negative per
-/// the law: content problems are Ok(None), never Err.
+/// it needs). 0 = live set found and copied, 1 = none (a cold start
+/// opens empty; content corruption — wrong checksums, twin
+/// disagreement — refuses the `wal_open` itself and never reaches
+/// this), -ENOBUFS = a buffer too small for the whole set (never a
+/// partial copy), negative = an unexpected IO error. The host maps
+/// 0/1/negative per the law: content problems are Ok(None), never Err.
 export fn wal_load(handle: ?*WalHandle, buf: [*]u8, len: usize, out_len: *usize) c_int {
     const h = handle orelse return -EINVAL;
     if (h.poisoned) return -EIO;
@@ -698,11 +679,24 @@ fn now_ns() u64 {
     return @intCast(@max(0, std.time.nanoTimestamp()));
 }
 
-/// Batch bookkeeping at the end of a submit (either stream): on the
-/// inline-completion platforms the writes completed inside the call, so
-/// the counters move now; on Linux the batch opens and completes at the
-/// pump. `deficit_rc` is the refusal code to return (0 = clean).
-fn finish_batch(h: *WalHandle, st: *StreamHandle, landed: usize, now: u64, deficit_rc: c_int) c_int {
+/// The generation's close (either stream): the batch's queued writes are
+/// entered (Linux — without the enter the SQEs sit queued forever, the
+/// pump never completes them, and the shutdown drain spins), the
+/// generation is marked complete, and the counters move: on the
+/// inline-completion platforms inside this call, on Linux at the pump.
+/// `deficit_rc` is the refusal code to return (0 = clean) — a refused
+/// batch takes the same close, so the records that landed are always in
+/// flight and complete normally.
+fn close_generation(h: *WalHandle, st: *StreamHandle, landed: usize, now: u64, deficit_rc: c_int) c_int {
+    if (!inline_completion) {
+        h.wal.io.submit_batch() catch {
+            h.poisoned = true;
+            return -EIO;
+        };
+    }
+
+    h.wal.complete_generation();
+
     if (inline_completion) {
         st.completed_records += landed;
         st.completed_generations += 1;
@@ -970,6 +964,9 @@ test "wal c: open refusals" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // An empty path is refused.
+    try testing.expect(wal_open("", 0) == null);
+
     // A path into a nonexistent directory is refused.
     const missing = try tmp.dir.realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(missing);
@@ -1000,6 +997,18 @@ test "wal c: open refusals" {
         try file.pwriteAll(&garbage, 1 * 1024 * 1024);
     }
     try testing.expect(wal_open(path.ptr, 0) == null);
+
+    // A second open of an owned file fails fast: the engine has exactly
+    // one owner (the exclusive non-blocking flock).
+    {
+        var fresh = testing.tmpDir(.{});
+        defer fresh.cleanup();
+        const clean = try tmp_wal_path_z(testing.allocator, &fresh);
+        defer testing.allocator.free(clean);
+        const first = wal_open(clean.ptr, 0) orelse return error.TestUnexpectedResult;
+        defer wal_close(first);
+        try testing.expect(wal_open(clean.ptr, 0) == null);
+    }
 }
 
 test "wal c: submit completes inline (darwin) with exact counters" {
@@ -1352,6 +1361,9 @@ test "wal c: null and poisoned handles" {
     var out_len: usize = 0;
     try testing.expectEqual(@as(c_int, -EIO), wal_load(handle, &bytes, bytes.len, &out_len));
     try testing.expectEqual(@as(c_int, -EIO), wal_flush_sync(handle, &bytes, bytes.len, &.{}, 0));
+
+    // A live handle with a null status out is a caller mistake.
+    try testing.expectEqual(@as(c_int, -EINVAL), wal_status(handle, null));
 }
 
 test "wal c: linux io_uring backend facts (compile-checked everywhere, executed on Linux)" {
@@ -1364,7 +1376,7 @@ test "wal c: linux io_uring backend facts (compile-checked everywhere, executed 
 
     // The ring geometry covers the worst case: a full compaction batch
     // plus a coexisting flush never overflows the completion depth.
-    const geometry = geometry_for(2);
+    const geometry = uring_backend.geometry_for_capacity(2);
     try testing.expect(geometry.entries >= 1024);
     try testing.expect(geometry.ops_len >= 4 * @as(u32, geometry.entries));
 
@@ -1496,6 +1508,12 @@ test "wal c: frame encode/decode refusals" {
     var rotted = encoded;
     rotted[wal_snapshot.fat_sha_offset + 3] ^= 0xFF;
     try testing.expectEqual(@as(c_int, -EINVAL), wal_frame_decode(&mirror, &rotted, rotted.len));
+
+    // The whole-frame checksum's own byte flips too: the deep integrity
+    // layer refuses the same way.
+    var deep = encoded;
+    deep[wal_snapshot.checksum_data_offset] ^= 0xFF;
+    try testing.expectEqual(@as(c_int, -EINVAL), wal_frame_decode(&mirror, &deep, deep.len));
 
     var foreign = encoded;
     foreign[wal_snapshot.tag_offset + 1] = 9;

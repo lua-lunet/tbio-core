@@ -19,14 +19,14 @@
 //! ```
 //!
 //! One shape per ring. The engine is a sans-IO state machine driven by
-//! the caller. This build drives it synchronously over page-cached
-//! blocking IO (`SyncIO`: posix pwrite/pread on top of the vendored
-//! `io/common.zig` primitives), with zero fsyncs in steady state and
-//! exactly one fsync on the shutdown flush — the one fsync covers both
-//! streams, which share the one file descriptor. The machine is generic
-//! over its IO (`WalType(IO)`) so the async backends (the Linux io_uring
-//! + eventfd backend, the darwin synchronous-completion backend) can
-//! replace the sync IO calls without touching the format or the logic.
+//! the caller, generic over its IO (`WalType(IO)`). The C ABI instantiates
+//! the seam per platform: the Linux io_uring + eventfd backend
+//! (`wal_uring_linux.zig`) and the inline-completion platforms'
+//! synchronous backend (`SyncIO`: posix pwrite/pread on top of the
+//! vendored `io/common.zig` primitives) — with zero fsyncs in steady
+//! state and exactly one fsync on the shutdown flush, the one fsync
+//! covering both streams, which share the one file descriptor. The IO
+//! seam keeps the format and the logic untouched by the backend.
 //!
 //! Record — 64 bytes fixed, exactly one cache line, little-endian, and
 //! memcpy-exact: the on-disk bytes ARE the struct's bytes (`WalRecord`, an
@@ -97,6 +97,8 @@ pub const checksum_data_offset: u32 = 60;
 /// expiry, lock id, lease id.
 pub const identity_size: u32 = 32;
 
+/// The 64-byte data record and the 40-byte header record, bytes — one
+/// full cache line and its identity header's compact form.
 pub const record_size: u32 = 64;
 pub const header_record_size: u32 = 40;
 /// The header record's tag and checksum offsets (its identity prefix is
@@ -202,6 +204,10 @@ pub const Kind = enum(u8) {
 /// The format version, encoded in the tag's second byte.
 pub const format_version: u8 = 1;
 
+/// The ephemeral tag codec: the kind's code in the low nibble, the
+/// format-version bits in the second byte. `tag_decode` is the decode
+/// half and the structure check at once — a tag from another format
+/// version, or an unknown kind code, is not a record.
 pub fn tag_encode(kind: Kind) u32 {
     return @intFromEnum(kind) | (@as(u32, format_version) << 8);
 }
@@ -360,14 +366,16 @@ pub fn record_decode(bytes: *const [record_size]u8) !WalRecord {
     return record;
 }
 
-/// Encode one identity header into its 40-byte on-disk form (checksum
-/// stamped into the struct's own field, then memcpy — same mechanics as
-/// the data record).
-fn header_record_encode(out: *[header_record_size]u8, header: WalHeader) void {
-    var stamped = header;
-    stamped.checksum = 0;
-    stamped.checksum = wal_checksum(mem.asBytes(&stamped)[0..header_checksum_offset]);
-    @memcpy(out, mem.asBytes(&stamped));
+/// Encode one identity header into its 40-byte on-disk form: the
+/// checksum stamped into the struct's own field (the checksum field is
+/// zero for the computation), then the struct's bytes copied out —
+/// memcpy-exact, the same mechanics as the data record. The header
+/// ring's only write path.
+fn header_record_of(record: WalRecord) WalHeader {
+    var header = record.header_of();
+    header.checksum = 0;
+    header.checksum = wal_checksum(mem.asBytes(&header)[0..header_checksum_offset]);
+    return header;
 }
 
 /// Decode + validate one on-disk header record: memcpy in, checksum
@@ -394,14 +402,6 @@ fn header_tag_valid(tag: u32) bool {
     };
 }
 
-/// The header ring twin of one record: its 40-byte on-disk record, as the
-/// struct it is (the live set's twin-agreement witness).
-fn header_record_of(record: WalRecord) WalHeader {
-    var bytes: [header_record_size]u8 = undefined;
-    header_record_encode(&bytes, record.header_of());
-    return mem.bytesToValue(WalHeader, &bytes);
-}
-
 // ---------------------------------------------------------------------------
 // The durable stream: kinds and fat frame.
 // ---------------------------------------------------------------------------
@@ -420,6 +420,8 @@ pub const DurableKind = enum(u8) {
     delete = 3,
 };
 
+/// The durable tag codec — the ephemeral codec's shape over the durable
+/// kinds (the version bits and the structure check identical).
 pub fn tag_encode_durable(kind: DurableKind) u32 {
     return @intFromEnum(kind) | (@as(u32, format_version) << 8);
 }
@@ -487,6 +489,8 @@ pub const FatFrame = extern struct {
         );
     }
 
+    /// The counters' renew count: how many lease renewals carried the
+    /// record since its take.
     pub fn renew_count(self: *const FatFrame) u32 {
         return mem.readInt(
             u32,
@@ -532,6 +536,9 @@ pub const DurableChange = struct {
     tag_bytes: []const u8 = &.{},
 };
 
+/// The frame codec's refusals: `InvalidRecord` — a zero lock id or a tag
+/// outside the durable kinds (a caller mistake, never on-disk rot);
+/// `RecordTooLarge` — a name or tag bytes over its budget.
 pub const FrameEncodeError = error{ InvalidRecord, RecordTooLarge };
 
 /// Encode one durable change into its 768-byte on-disk fat frame: the
@@ -567,13 +574,12 @@ pub fn frame_encode(out: *[fat_frame_size]u8, change: DurableChange) FrameEncode
     mem.writeInt(u16, counters[12..14], @intCast(change.tag_bytes.len), .little);
     @memcpy(counters[14..][0..change.tag_bytes.len], change.tag_bytes);
 
-    const bytes = mem.asBytes(&frame);
-    var sha: [fat_sha_size]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes[0..fat_sha_offset], &sha, .{});
-    @memcpy(bytes[fat_sha_offset..][0..fat_sha_size], &sha);
-
-    frame.header.checksum = wal_checksum(bytes);
-    @memcpy(out, bytes);
+    // Both integrity layers are one computation, shared with the
+    // compaction re-stamp: the stamp's write, the SHA-256 content hash
+    // over CL0-7, and the frame checksum — the same stamps the flush
+    // path re-stamps with.
+    frame_restamp(&frame, change.record.stamp);
+    @memcpy(out, mem.asBytes(&frame));
 }
 
 /// Decode + validate one on-disk fat frame: memcpy in, the frame
@@ -669,15 +675,24 @@ pub const SyncIO = struct {
         return .{ .fd = file.handle };
     }
 
+    /// Closes the file descriptor. A dirty close drops the in-flight
+    /// state by contract (the documented loss window) — the durability
+    /// the caller wanted belongs to the shutdown flush's `fsync`.
     pub fn close(self: SyncIO) void {
         common.aof_blocking_close(self.fd);
     }
 
+    /// One blocking pwrite at the fixed offset (the record's slot knows
+    /// it). The write is page-cached: no fsync, per the zero-fsync
+    /// ruling — the shutdown generation's `fsync` is the only one.
     pub fn write_at(self: *SyncIO, bytes: []const u8, offset: u64) !void {
         const file = std.fs.File{ .handle = self.fd };
         try file.pwriteAll(bytes, offset);
     }
 
+    /// A blocking pread that answers only when the whole span landed
+    /// (short reads are the read path's torn-record evidence, never a
+    /// silent partial copy).
     pub fn pread_all(self: *SyncIO, buffer: []u8, offset: u64) !usize {
         return common.aof_blocking_pread_all(self.fd, buffer, offset);
     }
@@ -701,10 +716,14 @@ pub const SyncIO = struct {
 // The engine.
 // ---------------------------------------------------------------------------
 
+/// A stream's alternating pairs: A and B, the rotating two-copy
+/// collection. Writes land in the active pair; compaction copies the
+/// live set forward into `other` and the pair flips.
 pub const Pair = enum(u1) {
     a,
     b,
 
+    /// The pair a compaction copies into (the active pair's alternate).
     fn other(self: Pair) Pair {
         return @enumFromInt(@intFromEnum(self) ^ 1);
     }
@@ -766,7 +785,8 @@ pub const Status = struct {
     /// Submissions outstanding (0 or 1 generation's worth); always 0
     /// between calls on the synchronous backend.
     in_flight: u32,
-    /// Flushes refused (capacity) since open.
+    /// Writes refused (capacity) since open — the steady path's refusals
+    /// and the flush path's failed stops alike.
     refusals: u64,
 };
 
@@ -845,8 +865,6 @@ pub fn WalType(comptime IO: type) type {
         refusals: u64 = 0,
         in_flight: u32 = 0,
 
-        pub const WalIO = IO;
-
         /// One stream's state, typed by the stream. Comptime stream
         /// parameter: the branch is resolved at compile time, no runtime
         /// stream dispatch anywhere on the paths.
@@ -882,6 +900,9 @@ pub fn WalType(comptime IO: type) type {
             self.dur.deinit(self.allocator);
         }
 
+        /// The counters' snapshot — the engine's own submit-time view;
+        /// the C ABI's `WalStatus` (completion-driven, per stream) is the
+        /// exposed truth.
         pub fn status(self: *const Engine) Status {
             return .{
                 .completed_generations = self.completed_generations,
@@ -892,38 +913,39 @@ pub fn WalType(comptime IO: type) type {
             };
         }
 
+        /// The ephemeral stream's live-set size.
         pub fn live_count(self: *const Engine) usize {
             return self.eph.live.count();
         }
 
+        /// The ephemeral live set's record for `lock_id`, or null.
         pub fn live_get(self: *const Engine, lock_id: u64) ?WalRecord {
             if (self.eph.live.get(lock_id)) |entry| return entry.record;
             return null;
         }
 
+        /// The durable stream's live-set size (live and kept records
+        /// alike).
         pub fn dur_live_count(self: *const Engine) usize {
             return self.dur.live.count();
         }
 
+        /// The durable live set's decoded fat frame for `lock_id`, or
+        /// null.
         pub fn dur_live_get(self: *const Engine, lock_id: u64) ?FatFrame {
             if (self.dur.live.get(lock_id)) |entry| return entry.frame;
             return null;
         }
 
+        /// The ephemeral stream's active pair's next slot (the position
+        /// the write path lands in).
         pub fn eph_position(self: *const Engine) u32 {
             return self.eph.position;
         }
 
-        pub fn eph_active(self: *const Engine) Pair {
-            return self.eph.active;
-        }
-
+        /// The durable stream's active pair's next slot.
         pub fn dur_position(self: *const Engine) u32 {
             return self.dur.position;
-        }
-
-        pub fn dur_active(self: *const Engine) Pair {
-            return self.dur.active;
         }
 
         /// The ephemeral live set encoded as on-disk data records into
@@ -931,8 +953,7 @@ pub fn WalType(comptime IO: type) type {
         /// submit path's input (one 64-byte record per live lock).
         /// Returns the byte count (0 = the live set is empty);
         /// `error.WalBufferTooSmall` when `buf` cannot hold the whole set
-        /// — never a partial copy. (The durable stream's load exchange is
-        /// the fat-frame wire format, a later seam.)
+        /// — never a partial copy.
         pub fn live_encode(self: *const Engine, buf: []u8) !usize {
             const need = self.eph.live.count() * record_size;
             if (buf.len < need) return error.WalBufferTooSmall;
@@ -1053,6 +1074,9 @@ pub fn WalType(comptime IO: type) type {
         /// The host's generation boundary: the caller marks the tick's
         /// batch complete once every changed lock's record has been
         /// submitted.
+        /// Marks one generation fully submitted (the engine's own
+        /// submit-time bookkeeping; the ABI's completion counters are
+        /// the exposed truth).
         pub fn complete_generation(self: *Engine) void {
             self.completed_generations += 1;
         }
@@ -1484,6 +1508,8 @@ pub fn WalType(comptime IO: type) type {
     };
 }
 
+/// The synchronous-backend engine instantiation — the type the engine's
+/// own tests drive; the C ABI instantiates the seam per platform.
 pub const Wal = WalType(SyncIO);
 
 // ---------------------------------------------------------------------------
@@ -1527,6 +1553,17 @@ fn poke_zeros(path: []const u8, offset: u64, count: usize) !void {
     defer file.close();
     var zeros = std.mem.zeroes([4096]u8);
     try file.pwriteAll(zeros[0..count], offset);
+}
+
+/// Copy raw bytes from one file offset to another (the byte swap the
+/// twin-agreement tests use: two individually valid records whose twins
+/// disagree).
+fn copy_bytes(path: []const u8, from: u64, to: u64, len: usize) !void {
+    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    defer file.close();
+    var buf: [4096]u8 = undefined;
+    const got = try file.preadAll(buf[0..len], from);
+    try file.pwriteAll(buf[0..got], to);
 }
 
 test "wal: cold start is empty" {
@@ -1585,15 +1622,17 @@ test "wal: record encode/decode round trip and checksum rejection" {
     data[checksum_data_offset + 1] ^= 0x01;
     try testing.expectError(error.CorruptRecord, record_decode(&data));
 
-    // The header record's own round trip and rejection: decode reproduces
-    // the identity header the record was built from.
-    var header_record: [header_record_size]u8 = undefined;
-    header_record_encode(&header_record, WalRecord.tombstone(7, 9, 10).header_of());
-    const header = try header_record_decode(&header_record);
+    // The header record's own round trip and rejection: the write path
+    // (the checksum-stamped header) decodes back to the identity the
+    // record was built from.
+    const stamped = header_record_of(WalRecord.tombstone(7, 9, 10));
+    const header = try header_record_decode(mem.asBytes(&stamped));
     try testing.expectEqual(@as(u64, 7), header.stamp);
     try testing.expectEqual(@as(u64, 9), header.lock_id);
     try testing.expectEqual(@as(u64, 10), header.lease_id);
     try testing.expectEqual(Kind.tombstone, tag_decode(header.tag).?);
+    var header_record: [header_record_size]u8 = undefined;
+    @memcpy(&header_record, mem.asBytes(&stamped));
     header_record[10] ^= 0x80;
     try testing.expectError(error.CorruptRecord, header_record_decode(&header_record));
 
@@ -1989,6 +2028,107 @@ test "wal: compaction fires at capacity, pairs flip, epoch selects the compacted
     try testing.expectEqual(@as(usize, 4), reopened.wal.live_count());
     try testing.expectEqual(@as(u64, 105), reopened.wal.live_get(1).?.lease_id);
     try testing.expect(reopened.wal.live_get(4) != null);
+    // Compaction re-stamps: every copied record carries the compaction's
+    // write clock (the epoch selector's freshness is exactly that).
+    try testing.expectEqual(@as(u64, now + 1), reopened.wal.live_get(1).?.stamp);
+    try testing.expectEqual(@as(u64, now + 1), reopened.wal.live_get(2).?.stamp);
+    try testing.expectEqual(@as(u64, now + 1), reopened.wal.live_get(3).?.stamp);
+}
+
+test "wal: an epoch stamp tie selects pair A, deterministically" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp_wal_path(allocator, &tmp);
+    defer allocator.free(path);
+
+    const now: u64 = 1_000_000_000_000;
+    {
+        var opened = try test_open(allocator, path, .{}, now);
+        defer opened.io.close();
+        defer opened.wal.deinit();
+
+        // One live record in pair A; pair B's header slot 0 gets the
+        // byte-identical record (the same stamp, valid checksums) —
+        // an exact tie, the unorderable wall clock the epoch rule
+        // resolves to pair A.
+        try opened.wal.submit(WalRecord.live(now, now + 10_000_000_000, 1, 101, Holder, Window), now);
+        try copy_bytes(
+            path,
+            header_base(.ephemeral, .a),
+            header_base(.ephemeral, .b),
+            header_record_size,
+        );
+    }
+
+    var reopened = try test_open(allocator, path, .{}, now);
+    defer reopened.io.close();
+    defer reopened.wal.deinit();
+
+    try testing.expectEqual(Pair.a, reopened.wal.eph.active);
+    try testing.expectEqual(@as(u32, 1), reopened.wal.eph.position);
+    try testing.expectEqual(@as(usize, 1), reopened.wal.live_count());
+    try testing.expectEqual(@as(u64, 101), reopened.wal.live_get(1).?.lease_id);
+}
+
+test "wal: compaction zeroes the target pair's header tail — a stale live record cannot resurrect" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp_wal_path(allocator, &tmp);
+    defer allocator.free(path);
+
+    const now: u64 = 1_000_000_000_000;
+    {
+        var opened = try test_open(allocator, path, .{ .capacity = 4 }, now);
+        defer opened.io.close();
+        defer opened.wal.deinit();
+
+        // Pair A's first generation: live1, live9, its tombstone, live2 —
+        // slot 3 (the pair's last slot) holds a live record for lock 2.
+        // The live set is {1, 2} at position 4.
+        try opened.wal.submit(WalRecord.live(now, now + 10_000_000_000, 1, 101, Holder, Window), now);
+        try opened.wal.submit(WalRecord.live(now, now + 10_000_000_000, 9, 109, Holder, Window), now);
+        try opened.wal.submit(
+            WalRecord{ .stamp = now, .expiry = 0, .lock_id = 9, .lease_id = 0, .tag = tag_encode(.tombstone) },
+            now,
+        );
+        try opened.wal.submit(WalRecord.live(now, now + 10_000_000_000, 2, 102, Holder, Window), now);
+        try testing.expectEqual(@as(u32, 4), opened.wal.eph.position);
+        try testing.expectEqual(@as(usize, 2), opened.wal.live_count());
+
+        // The next submit compacts A→B: {1, 2} copied, live3 lands at
+        // B slot 2. Then lock 2's tombstone fills B. The live set is
+        // {1, 3} at position 4.
+        try opened.wal.submit(WalRecord.live(now + 1, now + 10_000_000_000, 3, 103, Holder, Window), now + 1);
+        try opened.wal.submit(
+            WalRecord{ .stamp = now + 1, .expiry = 0, .lock_id = 2, .lease_id = 0, .tag = tag_encode(.tombstone) },
+            now + 1,
+        );
+        try testing.expectEqual(@as(usize, 2), opened.wal.live_count());
+
+        // The next submit compacts B→A: {1, 3} copies into A slots 0-1
+        // and A's header tail (slots 2-3 — the stale tombstone and, the
+        // dangerous one, the stale live record for lock 2) is zeroed;
+        // live4 lands at A slot 2.
+        try opened.wal.submit(WalRecord.live(now + 2, now + 10_000_000_000, 4, 104, Holder, Window), now + 2);
+        try testing.expectEqual(Pair.a, opened.wal.eph.active);
+        try testing.expectEqual(@as(u32, 3), opened.wal.eph.position);
+        try testing.expectEqual(@as(usize, 3), opened.wal.live_count());
+    }
+
+    // Reopen: the scan terminates exactly at the copied content — the
+    // stale live record for lock 2 at the zeroed tail slot is not read,
+    // lock 2 stays dead.
+    var reopened = try test_open(allocator, path, .{ .capacity = 4 }, now);
+    defer reopened.io.close();
+    defer reopened.wal.deinit();
+
+    try testing.expectEqual(Pair.a, reopened.wal.eph.active);
+    try testing.expectEqual(@as(u32, 3), reopened.wal.eph.position);
+    try testing.expectEqual(@as(usize, 3), reopened.wal.live_count());
+    try testing.expect(reopened.wal.live_get(2) == null);
+    try testing.expect(reopened.wal.live_get(4) != null);
 }
 
 test "wal: capacity overrun is a counted refusal, serving state unaffected" {
@@ -2055,6 +2195,90 @@ test "wal: header/data disagreement refused" {
 
     // Corrupt the header ring record: the scan refuses.
     try poke(path, header_base(.ephemeral, .a) + 5, 0xFF);
+    {
+        const opened = test_open(allocator, path, .{}, now);
+        try testing.expectError(error.CorruptRecord, opened);
+        if (opened) |bad| {
+            var b = bad;
+            b.io.close();
+            b.wal.deinit();
+        } else |_| {}
+    }
+}
+
+test "wal: twin disagreement with both checksums valid refused, both streams" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp_wal_path(allocator, &tmp);
+    defer allocator.free(path);
+
+    const now: u64 = 1_000_000_000_000;
+    {
+        var opened = try test_open(allocator, path, .{}, now);
+        defer opened.io.close();
+        defer opened.wal.deinit();
+
+        // Two live records per stream: slots 0 and 1.
+        try opened.wal.submit(WalRecord.live(now, now + 10_000_000_000, 1, 101, Holder, Window), now);
+        try opened.wal.submit(WalRecord.live(now, now + 10_000_000_000, 2, 102, Holder, Window), now);
+        try opened.wal.submit_durable(durable_change(.live, now, 5, "/five"), now);
+        try opened.wal.submit_durable(durable_change(.live, now, 6, "/six"), now);
+    }
+
+    // Swap the ephemeral header ring's slots 0 and 1: both headers are
+    // individually checksum-valid, but each slot's header twin (the
+    // other lock) disagrees with the data record under it — the identity
+    // prefix mismatch is the refusal.
+    try copy_bytes(
+        path,
+        header_base(.ephemeral, .a),
+        header_base(.ephemeral, .a) + 2 * header_record_size,
+        header_record_size,
+    );
+    try copy_bytes(
+        path,
+        header_base(.ephemeral, .a) + 1 * header_record_size,
+        header_base(.ephemeral, .a),
+        header_record_size,
+    );
+    try copy_bytes(
+        path,
+        header_base(.ephemeral, .a) + 2 * header_record_size,
+        header_base(.ephemeral, .a) + 1 * header_record_size,
+        header_record_size,
+    );
+    {
+        const opened = test_open(allocator, path, .{}, now);
+        try testing.expectError(error.CorruptRecord, opened);
+        if (opened) |bad| {
+            var b = bad;
+            b.io.close();
+            b.wal.deinit();
+        } else |_| {}
+    }
+
+    // The durable stream's same shape: valid frames under mismatched
+    // header-ring records. Both copies intact, the hydration's twin
+    // agreement refuses.
+    try copy_bytes(
+        path,
+        header_base(.durable, .a),
+        header_base(.durable, .a) + 2 * header_record_size,
+        header_record_size,
+    );
+    try copy_bytes(
+        path,
+        header_base(.durable, .a) + 1 * header_record_size,
+        header_base(.durable, .a),
+        header_record_size,
+    );
+    try copy_bytes(
+        path,
+        header_base(.durable, .a) + 2 * header_record_size,
+        header_base(.durable, .a) + 1 * header_record_size,
+        header_record_size,
+    );
     {
         const opened = test_open(allocator, path, .{}, now);
         try testing.expectError(error.CorruptRecord, opened);
@@ -2434,7 +2658,7 @@ test "wal: durable submit then reopen — the live set hydrates from the fat fra
         try testing.expectEqual(@as(usize, 2), opened.wal.dur_live_count());
         try testing.expectEqual(@as(u32, 2), opened.wal.dur_position());
         // The cold durable stream's epoch: pair A.
-        try testing.expectEqual(Pair.a, opened.wal.dur_active());
+        try testing.expectEqual(Pair.a, opened.wal.dur.active);
     }
 
     var reopened = try test_open(allocator, path, .{}, now);
@@ -2513,7 +2737,7 @@ test "wal: durable compaction includes kept records and flips the pair" {
         // including the kept record — into pair B, the pairs flip, then
         // the record lands on the flipped pair.
         try opened.wal.submit_durable(durable_change(.live, now + 1, 4, "/four"), now + 1);
-        try testing.expectEqual(Pair.b, opened.wal.dur_active());
+        try testing.expectEqual(Pair.b, opened.wal.dur.active);
         try testing.expectEqual(@as(u32, 4), opened.wal.dur_position());
     }
 
@@ -2523,7 +2747,7 @@ test "wal: durable compaction includes kept records and flips the pair" {
     defer reopened.io.close();
     defer reopened.wal.deinit();
 
-    try testing.expectEqual(Pair.b, reopened.wal.dur_active());
+    try testing.expectEqual(Pair.b, reopened.wal.dur.active);
     try testing.expectEqual(@as(usize, 4), reopened.wal.dur_live_count());
     try testing.expectEqual(DurableKind.kept, reopened.wal.dur_live_get(2).?.kind());
     try testing.expectEqualSlices(u8, "/four", reopened.wal.dur_live_get(4).?.name());
