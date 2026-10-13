@@ -38,9 +38,8 @@ fn ffi_append_read_round_trips_through_the_cdylib() {
     aof.close().unwrap();
 
     let active = active_file(&dir).expect("active file exists");
-    let mut it =
-        unsafe { tbio::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
-            .expect("iterator opens");
+    let mut it = unsafe { tbio::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
+        .expect("iterator opens");
     let first = it.next_entry().unwrap().expect("first entry");
     assert_eq!(first.op, 1);
     assert_eq!(first.bytes, payload_one.to_vec());
@@ -70,9 +69,8 @@ fn ffi_read_rejects_a_corrupted_entry_checksum() {
     bytes[body_at] ^= 0xFF;
     std::fs::write(&active, &bytes).unwrap();
 
-    let mut it =
-        unsafe { tbio::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
-            .expect("iterator opens");
+    let mut it = unsafe { tbio::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
+        .expect("iterator opens");
     assert_eq!(it.next_entry().unwrap_err(), tbio::ffi::SERVICE);
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -127,10 +125,7 @@ fn wrapper_append_rejects_oversized_records() {
     let dir = temp_dir("oversize");
     let mut aof = AofFile::open(&dir).expect("open");
     let oversized = vec![0u8; tbio::ffi::RECORD_MAX + 1];
-    assert!(matches!(
-        aof.append(&oversized),
-        Err(tbio::Error::TooLarge)
-    ));
+    assert!(matches!(aof.append(&oversized), Err(tbio::Error::TooLarge)));
     aof.close().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -169,9 +164,8 @@ fn wrapper_force_flush_on_round_trips_per_entry() {
     aof.close().unwrap();
 
     let active = active_file(&dir).unwrap();
-    let mut it =
-        unsafe { tbio::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
-            .expect("iterator opens");
+    let mut it = unsafe { tbio::ffi::RawIter::open(active.as_os_str().as_encoded_bytes()) }
+        .expect("iterator opens");
     let entry = it.next_entry().unwrap().expect("entry");
     assert_eq!(entry.bytes, b"forced durability".to_vec());
     std::fs::remove_dir_all(&dir).unwrap();
