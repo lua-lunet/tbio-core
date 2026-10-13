@@ -11,7 +11,7 @@ description, the C ABI, the optional force knob, the retention policy, and the s
 wiring live in [`AOF.md`](AOF.md); the upstream file map and every strip is recorded in
 [`VENDORED.md`](VENDORED.md).
 
-**What this crate is not.** It carries no WAL and no grid. Upstream's consensus WAL — two
+**What this crate is not.** It carries no VSR journal and no grid. Upstream's consensus WAL — two
 contiguous circular buffers, `Zone.wal_headers` for redundant headers and `Zone.wal_prepares` for
 the messages — and the async direct-IO backends that serve it are deliberately not vendored (see
 the strip list in `VENDORED.md`). The AOF is upstream's write-behind log of committed prepares,
@@ -19,11 +19,14 @@ written with plain blocking page-cached IO — upstream's own comment: "This is 
 O_DIRECT" — and upstream's own file doc states it "borrows durability from the WAL precisely
 because its writes are page-cached blocking calls". Files written here parse with upstream's
 `aof debug` / `aof merge`, and the vendored iterator reads any file upstream wrote; the name
-should not be read as a promise of WAL-grade semantics.
+should not be read as a promise of WAL-grade semantics. What this crate *does* carry since the
+WAL snapshot store is a different animal: the lock table's own rotating snapshot WAL
+(`wal_snapshot.zig`), built on the same vendored primitives, page-cached on the steady path,
+fsynced once on the shutdown generation — not the VSR journal, and never a substitute for it.
 
 ## What the C ABI exposes
 
-Two families over the vendored code (`zig/src/aof_c.zig`):
+Three families (`zig/src/aof_c.zig` for the first two, `zig/src/wal_c.zig` for the third):
 
 - **The AOF family** — `lunet_aof_open` (with the optional `force_flush` knob),
   `lunet_aof_append`, `lunet_aof_flush`, `lunet_aof_close`, and the reader
@@ -41,6 +44,13 @@ Two families over the vendored code (`zig/src/aof_c.zig`):
   the pair-aware write guard refuses a cross-system overwrite and a regressing crash counter — the
   identity law, `docs/uvrr-io-obligations.md` in uvrr-core, the termination chapter §4, after
   Lampson & Sturgis 1979 §5.1, "the good, the complete, or the newest").
+- **The WAL snapshot family** (`wal_c.zig`, over `wal_snapshot.zig`) — `wal_open`,
+  `wal_submit`, `wal_durable_submit`, `wal_pump`, `wal_event_fd`, `wal_flush_sync`,
+  `wal_load`, `wal_load_durable`, `wal_status`, `wal_close`, the record exchange
+  `wal_record_encode` / `wal_record_decode` / `wal_frame_encode` / `wal_frame_decode`, and
+  `wal_canary_bump_copy` / `wal_canary_fat_bump_copy` (the copy canary). Pointer-only
+  exchanges, caller-owned memory, errno-style refusals; the lock table's two-stream
+  double-ring rotating WAL, driven by the libuv loop.
 
 The Rust wrapper adds, above the C ABI and not exported through it: the safe `AofFile` surface
 with the optional force knob, the typed envelope record layer over the raw append, and the
@@ -61,6 +71,30 @@ with the optional force knob, the typed envelope record layer over the raw appen
   - `examples/lease-sequencer` takes **the AOF** as its flight recorder: the envelope records of
     the node's raw uVRR wire messages are appended through the vendored AOF and replayed by the
     bridge to serve the console UI (`/locks`, `/events`, `/metrics`, `/telemetry/log`).
+  - `ext/advisory_lock`'s `WalSnapshotStore` takes **the WAL snapshot store** as its
+    `StateStore`: the lock table's two-stream double-ring rotating WAL, driven by the libuv
+    loop with zero fsyncs on the steady path and one fsync on the shutdown generation.
+
+## Ownership and the alpha contract
+
+This crate is vast mostly because TigerBeetle built it: the vendored
+strip, the vendored primitives (`checksum.zig`, the message pool, the
+`vsr` core), and the conventions are upstream's, kept verbatim and
+stripped only where the strips are recorded. What this repository adds
+is a thin surface: the C ABIs (`aof_c.zig`, the WAL snapshot store's
+`wal_c.zig`), the WAL snapshot engine (`wal_snapshot.zig`, the two-stream
+double-ring rotating WAL of the lock table), the IO backends, and the
+thin safe Rust wrapper.
+
+It is consumed by, written for, and owned by
+[lunet-locks](https://github.com/lua-lunet/lunet-locks); there is no
+other consumer. The crate is **alpha and unreleased**: its release tags
+(`YYYY.MM.DD-${sha}`, annotated, cut on `main` only) are alpha tags, and
+anyone depending on this repository accepts that contract — the latest
+alpha tag is the only supported state, no backwards compatibility, no
+migration, and old artefacts are deleted rather than kept alive. When
+lunet-locks itself stabilises, this crate's contract stabilises with it;
+until then, the tags name the evidence, and nothing else.
 
 ## Layout
 
@@ -68,7 +102,11 @@ with the optional force knob, the typed envelope record layer over the raw appen
 |---|---|
 | `zig/src/` | The vendored strip (`aof.zig`, `marker.zig`, the vendored `vsr/superblock*.zig`, and the minimal dependency closure; see VENDORED.md) |
 | `zig/src/aof_c.zig` | The C ABI surface over the vendored strip (crate-owned) |
-| `zig/build.zig` | cdylib + static library + test steps, the `vsr_options` module, the fine-grain log gate |
+| `zig/src/wal_snapshot.zig` | The two-stream double-ring rotating WAL: the lock table's snapshot engine (crate-owned) |
+| `zig/src/wal_c.zig` | The WAL snapshot store's C ABI surface (crate-owned) |
+| `zig/src/wal_canary.zig` | The copy canary: the cross-ABI layout/endianness proof (crate-owned) |
+| `zig/src/io/wal_uring_linux.zig` | The Linux io_uring + eventfd backend of the WAL store (crate-owned) |
+| `zig/build.zig` | cdylib + static library + test steps, the `vsr_options` module, the fine-grain log gate, the `check-linux` cross-compile gate |
 | `src/lib.rs` | Safe wrapper: `AofFile` open/append/flush/close with the optional force knob |
 | `src/marker.rs` | The lifecycle marker surface over the vendored superblock copies |
 | `src/envelope.rs` | The typed telemetry record layer over the raw AOF append |
