@@ -28,7 +28,19 @@ const constants = @import("constants.zig");
 const marker = @import("marker.zig");
 const superblock = @import("vsr/superblock.zig");
 const vsr = @import("vsr.zig");
+const wal_c = @import("wal_c.zig");
+const wal_canary = @import("wal_canary.zig");
 const io_backend = @import("io.zig");
+
+comptime {
+    // The WAL snapshot store's C ABI: the exports compile and land in
+    // the cdylib with the AOF surface's (the module root is what the
+    // build compiles; the exports are eager from a referenced file).
+    _ = wal_c;
+    // The copy canary's export rides the same surface (see
+    // wal_canary.zig: the cross-ABI interop proof).
+    _ = wal_canary;
+}
 
 const AOF = aof.AOFType(io_backend.IO);
 const Header = vsr.Header;
@@ -613,6 +625,10 @@ const census_files = [_]CensusFile{
     .{ .name = "vsr/message_header.zig", .source = @embedFile("vsr/message_header.zig"), .below_warn = 0, .fine_warn = 0 },
     .{ .name = "vsr/superblock.zig", .source = @embedFile("vsr/superblock.zig"), .below_warn = 8, .fine_warn = 0 },
     .{ .name = "vsr/superblock_quorums.zig", .source = @embedFile("vsr/superblock_quorums.zig"), .below_warn = 2, .fine_warn = 5 },
+    .{ .name = "wal_c.zig", .source = @embedFile("wal_c.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "wal_canary.zig", .source = @embedFile("wal_canary.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "wal_snapshot.zig", .source = @embedFile("wal_snapshot.zig"), .below_warn = 0, .fine_warn = 0 },
+    .{ .name = "io/wal_uring_linux.zig", .source = @embedFile("io/wal_uring_linux.zig"), .below_warn = 0, .fine_warn = 0 },
 };
 
 /// The vendored quorum file: the one source whose warn-level detail is
@@ -621,7 +637,7 @@ const census_quorum_file = "vsr/superblock_quorums.zig";
 
 /// The crate-owned files (not vendored): a raw print in our own code is
 /// a fine-grain site outside every gate.
-const census_owned = [_][]const u8{ "aof_c.zig", "marker.zig", "io.zig" };
+const census_owned = [_][]const u8{ "aof_c.zig", "marker.zig", "io.zig", "wal_c.zig", "wal_canary.zig", "wal_snapshot.zig", "io/wal_uring_linux.zig" };
 
 /// One failed census assertion: logged at warn (the runner prints warn
 /// lines, and a Debug-mode cdylib pins its level at warn too), then
@@ -648,6 +664,22 @@ fn census_count(source: []const u8, needle: []const u8) usize {
 // run first, before any other file's tests log.
 test {
     if (gate.fine_logs) std.testing.log_level = .debug;
+}
+
+test {
+    // Pulls the WAL snapshot store's engine and its tests into the suite
+    // (the test step is rooted here).
+    _ = @import("wal_snapshot.zig");
+}
+
+test {
+    // Pulls the WAL snapshot store's C ABI and its tests into the suite.
+    _ = @import("wal_c.zig");
+}
+
+test {
+    // Pulls the copy canary and its tests into the suite.
+    _ = @import("wal_canary.zig");
 }
 
 test "the fine-grain log census: every site behind a gate, every gate declared" {
