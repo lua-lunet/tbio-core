@@ -112,10 +112,7 @@ fn main() {
 fn locate_zig() -> PathBuf {
     if let Ok(path) = std::env::var("TBIO_ZIG") {
         let path = PathBuf::from(path);
-        assert!(
-            path.exists(),
-            "TBIO_ZIG does not exist: {path:?}"
-        );
+        assert!(path.exists(), "TBIO_ZIG does not exist: {path:?}");
         return path;
     }
 
