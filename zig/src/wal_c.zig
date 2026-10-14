@@ -136,8 +136,17 @@ export fn wal_open(path: [*:0]const u8, capacity: u32) ?*WalHandle {
     const path_len = mem.len(path);
     if (path_len == 0 or path_len > std.fs.max_path_bytes) return null;
 
+    const capacity_effective = if (capacity == 0) wal_snapshot.capacity_default else capacity;
+    // The capacity honesty law: a generation that exceeds the capacity is
+    // a refused flush, and a capacity beyond the ring's fixed geometry is
+    // a refused OPEN — the file's every offset is fixed, so the caller's
+    // sizing knob is bounded. A caller error is refused like any other
+    // open refusal (null), never an assertion: the ring's geometry
+    // arithmetic is only ever handed a capacity inside its bound.
+    if (capacity_effective > wal_snapshot.ring_capacity_max) return null;
+
     const config = wal_snapshot.Config{
-        .capacity = if (capacity == 0) wal_snapshot.capacity_default else capacity,
+        .capacity = capacity_effective,
     };
 
     const io = backend_open(path[0..path_len], config.capacity) catch return null;
@@ -828,6 +837,28 @@ fn tmp_wal_path_z(allocator: mem.Allocator, tmp: *testing.TmpDir) ![:0]u8 {
     return try allocator.dupeZ(u8, joined);
 }
 
+/// The steady loop's cadence, compressed. The linux ring's completions
+/// land with real time — the pump reaps only what the kernel has
+/// posted — while the darwin backend completes inside the submit. The
+/// beat is the production loop's ~1000 ms tick, sped up: pump, then a
+/// bounded wait for the outstanding batch to complete, pumping as the
+/// completions arrive. Every test step that reads a completed counter,
+/// submits again, closes, reopens, or flushes holds only past a beat.
+fn beat(handle: *WalHandle) void {
+    _ = wal_pump(handle);
+    var attempts: usize = 0;
+    while (attempts < 80) : (attempts += 1) {
+        var status: WalStatus = undefined;
+        _ = wal_status(handle, &status);
+        if (status.ephemeral.in_flight == 0 and status.durable.in_flight == 0) {
+            return;
+        }
+        std.Thread.sleep(25 * std.time.ns_per_ms);
+        _ = wal_pump(handle);
+    }
+    @panic("the wal test's batch never completed");
+}
+
 test "wal c: record encode/decode round trip through the ABI (one codec)" {
     // Fields in, engine bytes out: the ABI's encode is byte-identical to
     // the engine's own codec — the same implementation, one checksum.
@@ -960,21 +991,23 @@ test "wal c: open cold start, status zero, event fd" {
     }
 }
 
-test "wal c: open refusals" {
+test "wal c: open refusals (empty path)" {
+    try testing.expect(wal_open("", 0) == null);
+}
+
+test "wal c: open refusals (missing dir)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-
-    // An empty path is refused.
-    try testing.expect(wal_open("", 0) == null);
-
-    // A path into a nonexistent directory is refused.
     const missing = try tmp.dir.realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(missing);
     const bad = try std.fmt.allocPrintZ(testing.allocator, "{s}/nope/snapshot.wal", .{missing});
     defer testing.allocator.free(bad);
     try testing.expect(wal_open(bad.ptr, 0) == null);
+}
 
-    // A wrong-size file is refused (the layout's every offset is fixed).
+test "wal c: open refusals (wrong size)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
     const path = try tmp_wal_path_z(testing.allocator, &tmp);
     defer testing.allocator.free(path);
     {
@@ -983,32 +1016,39 @@ test "wal c: open refusals" {
         try file.setEndPos(wal_snapshot.file_size - 1);
     }
     try testing.expect(wal_open(path.ptr, 0) == null);
+}
 
-    // A capacity beyond the ring geometry is refused.
+test "wal c: open refusals (capacity)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp_wal_path_z(testing.allocator, &tmp);
+    defer testing.allocator.free(path);
     try testing.expect(wal_open(path.ptr, wal_snapshot.ring_capacity_max + 1) == null);
+}
 
-    // A file the right size but with a corrupt active header ring is
-    // refused at open (the epoch read's checksum gate).
+test "wal c: open refusals (corrupt header)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp_wal_path_z(testing.allocator, &tmp);
+    defer testing.allocator.free(path);
     {
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
         try file.setEndPos(wal_snapshot.file_size);
         var garbage: [wal_snapshot.header_record_size]u8 = @splat(0xAA);
         try file.pwriteAll(&garbage, 1 * 1024 * 1024);
     }
     try testing.expect(wal_open(path.ptr, 0) == null);
+}
 
-    // A second open of an owned file fails fast: the engine has exactly
-    // one owner (the exclusive non-blocking flock).
-    {
-        var fresh = testing.tmpDir(.{});
-        defer fresh.cleanup();
-        const clean = try tmp_wal_path_z(testing.allocator, &fresh);
-        defer testing.allocator.free(clean);
-        const first = wal_open(clean.ptr, 0) orelse return error.TestUnexpectedResult;
-        defer wal_close(first);
-        try testing.expect(wal_open(clean.ptr, 0) == null);
-    }
+test "wal c: open refusals (busy)" {
+    var fresh = testing.tmpDir(.{});
+    defer fresh.cleanup();
+    const clean = try tmp_wal_path_z(testing.allocator, &fresh);
+    defer testing.allocator.free(clean);
+    const first = wal_open(clean.ptr, 0) orelse return error.TestUnexpectedResult;
+    defer wal_close(first);
+    try testing.expect(wal_open(clean.ptr, 0) == null);
 }
 
 test "wal c: submit completes inline (darwin) with exact counters" {
@@ -1038,7 +1078,7 @@ test "wal c: submit completes inline (darwin) with exact counters" {
         try testing.expectEqual(@as(u64, 3), status.ephemeral.completed_records);
         try testing.expectEqual(@as(u32, 0), status.ephemeral.in_flight);
         try testing.expect(status.last_completed_unix_ns > 0);
-        try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+        beat(handle);
         try testing.expectEqual(@as(u64, 1), status.ephemeral.completed_generations);
     } else {
         // Linux: submitted, in flight until the pump.
@@ -1048,7 +1088,7 @@ test "wal c: submit completes inline (darwin) with exact counters" {
         try testing.expectEqual(@as(u32, 3), status.ephemeral.in_flight);
         try testing.expectEqual(@as(u64, 0), status.ephemeral.completed_generations);
 
-        try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+        beat(handle);
         try testing.expectEqual(@as(c_int, 0), wal_status(handle, &status));
         try testing.expectEqual(@as(u64, 1), status.ephemeral.completed_generations);
         try testing.expectEqual(@as(u64, 3), status.ephemeral.completed_records);
@@ -1095,8 +1135,10 @@ test "wal c: steady capacity refusal counted, serving state unaffected" {
     const now = now_ns();
     var bytes = record_bytes_live(now, now + 10_000_000_000, 1, 100);
     try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &bytes, bytes.len));
+    if (!inline_completion) beat(handle);
     bytes = record_bytes_live(now, now + 10_000_000_000, 2, 101);
     try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &bytes, bytes.len));
+    if (!inline_completion) beat(handle);
 
     // The live set fills the ring: the third lock is a counted refusal.
     bytes = record_bytes_live(now, now + 10_000_000_000, 3, 102);
@@ -1104,7 +1146,7 @@ test "wal c: steady capacity refusal counted, serving state unaffected" {
     try testing.expectEqual(@as(u64, 1), handle.eph.refusals);
 
     // The landed records still complete normally.
-    if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    if (!inline_completion) beat(handle);
     var status: WalStatus = undefined;
     _ = wal_status(handle, &status);
     try testing.expectEqual(@as(u64, 2), status.ephemeral.completed_records);
@@ -1132,7 +1174,7 @@ test "wal c: load round trip through the ABI" {
         @memcpy(batch[0..wal_snapshot.record_size], &a);
         @memcpy(batch[wal_snapshot.record_size..], &b);
         try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &batch, batch.len));
-        if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+        if (!inline_completion) beat(handle);
         wal_close(handle);
     }
 
@@ -1187,7 +1229,7 @@ test "wal c: flush_sync lands the set, fsyncs exactly once, reopen reads it" {
         @memcpy(batch[0..wal_snapshot.record_size], &a);
         @memcpy(batch[wal_snapshot.record_size..], &b);
         try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &batch, batch.len));
-        if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+        if (!inline_completion) beat(handle);
 
         // The shutdown generation: the caller's full live set.
         try testing.expectEqual(@as(c_int, 0), wal_flush_sync(handle, &batch, batch.len, &.{}, 0));
@@ -1235,7 +1277,7 @@ test "wal c: flush_sync refusals — bad set, tombstone, mirror disagreement, ca
 
     var bytes = record_bytes_live(now, now + 10_000_000_000, 1, 100);
     try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &bytes, bytes.len));
-    if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    if (!inline_completion) beat(handle);
 
     // A length that is not a multiple of the record size.
     try testing.expectEqual(@as(c_int, -EINVAL), wal_flush_sync(handle, &bytes, wal_snapshot.record_size - 1, &.{}, 0));
@@ -1272,7 +1314,7 @@ test "wal c: flush_sync refusals — bad set, tombstone, mirror disagreement, ca
     // flush of the full set overruns.
     bytes = record_bytes_live(now, now + 10_000_000_000, 2, 101);
     try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &bytes, bytes.len));
-    if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    if (!inline_completion) beat(handle);
     // position 2, live 2, capacity 2: 2 + 2 > 2 → the failed stop.
     var full: [2 * wal_snapshot.record_size]u8 = undefined;
     @memcpy(full[0..wal_snapshot.record_size], &record_bytes_live(now, now + 10_000_000_000, 1, 100));
@@ -1315,7 +1357,7 @@ test "wal c: close drops the dirty in-flight state" {
 
     var bytes = record_bytes_live(now, now + 10_000_000_000, 1, 100);
     try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &bytes, bytes.len));
-    if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    if (!inline_completion) beat(handle);
 
     // A dirty close: no flush, no fsync — the loss window. The page
     // cache still holds the generation, so the reopen below finds it;
@@ -1379,8 +1421,9 @@ test "wal c: linux io_uring backend facts (compile-checked everywhere, executed 
     const geometry = uring_backend.geometry_for_capacity(2);
     try testing.expect(geometry.entries >= 1024);
     try testing.expect(geometry.ops_len >= 4 * @as(u32, geometry.entries));
-
-    const handle = wal_open(path.ptr, 2) orelse return error.TestUnexpectedResult;
+    // The handle itself rides the default capacity: the flush at the
+    // end rewrites a live set the capacity-2 ring could not hold.
+    const handle = wal_open(path.ptr, 0) orelse return error.TestUnexpectedResult;
     defer wal_close(handle);
 
     // The eventfd is real and registered with the ring.
@@ -1388,7 +1431,23 @@ test "wal c: linux io_uring backend facts (compile-checked everywhere, executed 
     try testing.expect(efd >= 0);
     const event_fd: std.posix.fd_t = @intCast(efd);
     const flags = try std.posix.fcntl(event_fd, std.posix.F.GETFL, 0);
-    try testing.expect((@as(u32, @intCast(flags)) & std.posix.O.NONBLOCK) != 0);
+    // O_NONBLOCK's bit, read off the struct's own field layout. The
+    // named member does not resolve through the type on aarch64-linux
+    // in the pinned 0.14.1 toolchain (the field is in the struct —
+    // typeInfo sees it — and the named access refuses it), so the bit
+    // is walked: packed fields lay out least-significant-bit first,
+    // and the field's position is the sum of the widths before it.
+    const o_nonblock_bit: u32 = blk: {
+        var bit: u32 = 0;
+        inline for (@typeInfo(std.posix.O).@"struct".fields) |f| {
+            if (std.mem.eql(u8, f.name, "NONBLOCK")) {
+                break :blk @as(u32, 1) << @intCast(bit);
+            }
+            bit += @bitSizeOf(f.type);
+        }
+        break :blk 0;
+    };
+    try testing.expect((@as(u32, @intCast(flags)) & o_nonblock_bit) != 0);
 
     // The eventfd wakes on completions: submit, then wait on the fd.
     const now = now_ns();
@@ -1402,13 +1461,15 @@ test "wal c: linux io_uring backend facts (compile-checked everywhere, executed 
     // Block on the eventfd (up to a second): the kernel posts one event
     // per completion. The ABI's pump then drains.
     var wake: [8]u8 = undefined;
-    const poll_fds = [_]std.posix.pollfd{.{ .fd = event_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    // The pollfd array is the poll's own scratch (the kernel may write
+    // revents through it), so it is mutable.
+    var poll_fds = [_]std.posix.pollfd{.{ .fd = event_fd, .events = std.posix.POLL.IN, .revents = 0 }};
     const ready = try std.posix.poll(&poll_fds, 1000);
     try testing.expectEqual(@as(usize, 1), ready);
     const got = try std.posix.read(event_fd, &wake);
     try testing.expect(got > 0);
 
-    try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    beat(handle);
     try testing.expectEqual(@as(c_int, 0), wal_status(handle, &status));
     try testing.expectEqual(@as(u64, 1), status.ephemeral.completed_generations);
     try testing.expectEqual(@as(u64, 1), status.ephemeral.completed_records);
@@ -1427,13 +1488,23 @@ test "wal c: linux io_uring backend facts (compile-checked everywhere, executed 
     try testing.expectEqual(@as(c_int, -EAGAIN), wal_durable_submit(handle, &frame, frame.len));
 
     // The flush_sync path drains the outstanding batches first, so the
-    // shutdown is clean without an explicit pump.
-    try testing.expectEqual(@as(c_int, 0), wal_flush_sync(handle, &bytes, bytes.len, &frame, frame.len));
+    // shutdown is clean without an explicit pump. The flush's live set
+    // matches the engine's mirror: BOTH ephemeral records (the first
+    // generation's record 1 is still live — no tombstone was submitted
+    // for it) and the durable frame.
+    var live_set: [2 * wal_snapshot.record_size]u8 = undefined;
+    @memcpy(live_set[0..wal_snapshot.record_size], &record_bytes_live(now, now + 10_000_000_000, 1, 100));
+    @memcpy(live_set[wal_snapshot.record_size..], &bytes);
+    try testing.expectEqual(@as(c_int, 0), wal_flush_sync(handle, &live_set, live_set.len, &frame, frame.len));
     _ = wal_status(handle, &status);
-    try testing.expectEqual(@as(u64, 2), status.ephemeral.completed_generations);
-    try testing.expectEqual(@as(u64, 3), status.ephemeral.completed_records);
-    try testing.expectEqual(@as(u64, 1), status.durable.completed_generations);
-    try testing.expectEqual(@as(u64, 1), status.durable.completed_records);
+    // The generations: record 1's submit, record 2's submit, the flush's
+    // own set — three ephemeral generations, four records; the durable
+    // frame's submit and the flush's frame — two generations, two
+    // records.
+    try testing.expectEqual(@as(u64, 3), status.ephemeral.completed_generations);
+    try testing.expectEqual(@as(u64, 4), status.ephemeral.completed_records);
+    try testing.expectEqual(@as(u64, 2), status.durable.completed_generations);
+    try testing.expectEqual(@as(u64, 2), status.durable.completed_records);
     try testing.expectEqual(@as(u32, 0), status.ephemeral.in_flight);
     try testing.expectEqual(@as(u32, 0), status.durable.in_flight);
 }
@@ -1546,7 +1617,7 @@ test "wal c: durable submit and load round trip through the ABI" {
         @memcpy(batch[wal_snapshot.fat_frame_size..], &kept);
 
         try testing.expectEqual(@as(c_int, 0), wal_durable_submit(handle, &batch, batch.len));
-        if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+        if (!inline_completion) beat(handle);
 
         var status: WalStatus = undefined;
         try testing.expectEqual(@as(c_int, 0), wal_status(handle, &status));
@@ -1640,6 +1711,7 @@ test "wal c: durable capacity refusal counted on the durable row" {
     @memcpy(batch[0..wal_snapshot.fat_frame_size], &a);
     @memcpy(batch[wal_snapshot.fat_frame_size..], &b);
     try testing.expectEqual(@as(c_int, 0), wal_durable_submit(handle, &batch, batch.len));
+    if (!inline_completion) beat(handle);
 
     // The live set fills the ring: the third lock is a counted refusal.
     var c = durable_frame(.live, now, now + 10_000_000_000, 3, 102, "/three", 7, 0, &.{});
@@ -1648,7 +1720,7 @@ test "wal c: durable capacity refusal counted on the durable row" {
     try testing.expectEqual(@as(u64, 0), handle.eph.refusals);
 
     // The landed frames still complete normally.
-    if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    if (!inline_completion) beat(handle);
     var status: WalStatus = undefined;
     _ = wal_status(handle, &status);
     try testing.expectEqual(@as(u64, 2), status.durable.completed_records);
@@ -1671,13 +1743,13 @@ test "wal c: flush_sync lands both streams, one fsync, reopen reads both" {
         @memcpy(eph_batch[0..wal_snapshot.record_size], &a);
         @memcpy(eph_batch[wal_snapshot.record_size..], &b);
         try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &eph_batch, eph_batch.len));
-        if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+        if (!inline_completion) beat(handle);
 
         var dur_batch: [1 * wal_snapshot.fat_frame_size]u8 = undefined;
         const frame = durable_frame(.live, now, now + 10_000_000_000, 5, 50, "/five", 5, 2, "lane-a");
         @memcpy(&dur_batch, &frame);
         try testing.expectEqual(@as(c_int, 0), wal_durable_submit(handle, &dur_batch, dur_batch.len));
-        if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+        if (!inline_completion) beat(handle);
 
         // The shutdown generation: the caller's full live sets, both
         // streams, one fsync.
@@ -1735,7 +1807,7 @@ test "wal c: flush_sync durable refusals — corruption, drift, capacity; the ke
 
     var frame = durable_frame(.live, now, now + 10_000_000_000, 1, 100, "/one", 5, 1, "lane-a");
     try testing.expectEqual(@as(c_int, 0), wal_durable_submit(handle, &frame, frame.len));
-    if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    if (!inline_completion) beat(handle);
 
     // A durable length that is not a multiple of the frame size.
     try testing.expectEqual(@as(c_int, -EINVAL), wal_flush_sync(handle, &.{}, 0, &frame, frame.len - 1));
@@ -1771,7 +1843,7 @@ test "wal c: flush_sync durable refusals — corruption, drift, capacity; the ke
     // fill the pair with a second lock, then flush the two-frame set).
     var second = durable_frame(.live, now, now + 10_000_000_000, 2, 101, "/two", 6, 0, &.{});
     try testing.expectEqual(@as(c_int, 0), wal_durable_submit(handle, &second, second.len));
-    if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    if (!inline_completion) beat(handle);
     var full: [2 * wal_snapshot.fat_frame_size]u8 = undefined;
     @memcpy(full[0..wal_snapshot.fat_frame_size], &frame);
     @memcpy(full[wal_snapshot.fat_frame_size..], &second);
@@ -1787,9 +1859,9 @@ test "wal c: flush_sync durable refusals — corruption, drift, capacity; the ke
     var eph_a = record_bytes_live(now, now + 10_000_000_000, 1, 100);
     var eph_b = record_bytes_live(now, now + 10_000_000_000, 2, 101);
     try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &eph_a, eph_a.len));
-    if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    if (!inline_completion) beat(handle);
     try testing.expectEqual(@as(c_int, 0), wal_submit(handle, &eph_b, eph_b.len));
-    if (!inline_completion) try testing.expectEqual(@as(c_int, 0), wal_pump(handle));
+    if (!inline_completion) beat(handle);
     var eph_full: [2 * wal_snapshot.record_size]u8 = undefined;
     @memcpy(eph_full[0..wal_snapshot.record_size], &eph_a);
     @memcpy(eph_full[wal_snapshot.record_size..], &eph_b);
