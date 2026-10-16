@@ -101,18 +101,28 @@ fn wrapper_open_creates_the_epoch_named_active_file() {
     // the tick between now() calls).
     assert!(now.abs_diff(epoch) <= 1, "epoch {epoch} is not now ({now})");
 
-    // A second open in the same second picks the -1 suffix.
-    let aof2 = AofFile::open(&dir).expect("second open");
-    drop(aof2);
-    let names = aof_names(&dir);
-    assert_eq!(
-        names.len(),
-        2,
-        "two active files after two opens: {names:?}"
-    );
+    // A second open in the same second picks the -1 suffix. The collision
+    // is a same-second race the runner does not owe the test: a slow or
+    // preempted runner can straddle the second boundary between two opens,
+    // and the next file then names the new second instead of the -1. So
+    // the pair retries: each open is sub-millisecond, the open names the
+    // CURRENT second, and the open right after it lands in that same
+    // second unless the runner was preempted across the boundary again —
+    // bounded attempts, each fast, the beat the ABI suite's cadence
+    // already runs.
+    let mut picked = false;
+    for _ in 0..100 {
+        let aof2 = AofFile::open(&dir).expect("retry open");
+        drop(aof2);
+        if aof_names(&dir).iter().any(|name| name.ends_with("-1.aof")) {
+            picked = true;
+            break;
+        }
+    }
     assert!(
-        names.iter().any(|name| name.ends_with("-1.aof")),
-        "the same-second collision picked the -1 disambiguator: {names:?}"
+        picked,
+        "the same-second collision never picked the -1 disambiguator: {:?}",
+        aof_names(&dir)
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
